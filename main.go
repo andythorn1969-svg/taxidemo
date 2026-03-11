@@ -7,6 +7,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -32,6 +33,8 @@ type Driver struct {
 	ZoneID string
 	Status DriverStatus
 	FreeAt time.Time // when they became available - determines trap position
+	Lat    float64   // GPS latitude
+	Lng    float64   // GPS longitude
 }
 
 // Zone represents a geographic dispatch area with an ordered trap queue
@@ -96,18 +99,19 @@ type Job struct {
 func seedData() ([]*Zone, []*Driver) {
 	now := time.Now()
 
-	// Create drivers with varying free times (determines trap order)
+	// Create drivers with varying free times (determines trap order) and
+	// approximate GPS coordinates around Southend-on-Sea per zone.
 	drivers := []*Driver{
-		{ID: "D01", Name: "Alice Brown", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-45 * time.Minute)},
-		{ID: "D02", Name: "Bob Carter", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-30 * time.Minute)},
-		{ID: "D03", Name: "Carol Davies", ZoneID: "Z02", Status: StatusAvailable, FreeAt: now.Add(-60 * time.Minute)},
-		{ID: "D04", Name: "Dave Ellis", ZoneID: "Z02", Status: StatusAvailable, FreeAt: now.Add(-15 * time.Minute)},
-		{ID: "D05", Name: "Emma Foster", ZoneID: "Z03", Status: StatusAvailable, FreeAt: now.Add(-90 * time.Minute)},
-		{ID: "D06", Name: "Frank Green", ZoneID: "Z03", Status: StatusAvailable, FreeAt: now.Add(-20 * time.Minute)},
-		{ID: "D07", Name: "Grace Hill", ZoneID: "Z04", Status: StatusAvailable, FreeAt: now.Add(-55 * time.Minute)},
-		{ID: "D08", Name: "Harry Irving", ZoneID: "Z04", Status: StatusBusy, FreeAt: now.Add(-10 * time.Minute)},
-		{ID: "D09", Name: "Isla Jones", ZoneID: "Z05", Status: StatusAvailable, FreeAt: now.Add(-35 * time.Minute)}, // West
-		{ID: "D10", Name: "Jack King", ZoneID: "Z05", Status: StatusAvailable, FreeAt: now.Add(-25 * time.Minute)},  // West
+		{ID: "D01", Name: "Alice Brown", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-45 * time.Minute), Lat: 51.559, Lng: 0.636}, // North
+		{ID: "D02", Name: "Bob Carter", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-30 * time.Minute), Lat: 51.557, Lng: 0.639}, // North
+		{ID: "D03", Name: "Carol Davies", ZoneID: "Z02", Status: StatusAvailable, FreeAt: now.Add(-60 * time.Minute), Lat: 51.535, Lng: 0.713}, // South
+		{ID: "D04", Name: "Dave Ellis", ZoneID: "Z02", Status: StatusAvailable, FreeAt: now.Add(-15 * time.Minute), Lat: 51.532, Lng: 0.716}, // South
+		{ID: "D05", Name: "Emma Foster", ZoneID: "Z03", Status: StatusAvailable, FreeAt: now.Add(-90 * time.Minute), Lat: 51.532, Lng: 0.809}, // East
+		{ID: "D06", Name: "Frank Green", ZoneID: "Z03", Status: StatusAvailable, FreeAt: now.Add(-20 * time.Minute), Lat: 51.529, Lng: 0.807}, // East
+		{ID: "D07", Name: "Grace Hill", ZoneID: "Z04", Status: StatusAvailable, FreeAt: now.Add(-55 * time.Minute), Lat: 51.544, Lng: 0.709}, // Central
+		{ID: "D08", Name: "Harry Irving", ZoneID: "Z04", Status: StatusBusy, FreeAt: now.Add(-10 * time.Minute), Lat: 51.542, Lng: 0.712},    // Central
+		{ID: "D09", Name: "Isla Jones", ZoneID: "Z05", Status: StatusAvailable, FreeAt: now.Add(-35 * time.Minute), Lat: 51.558, Lng: 0.597}, // West
+		{ID: "D10", Name: "Jack King", ZoneID: "Z05", Status: StatusAvailable, FreeAt: now.Add(-25 * time.Minute), Lat: 51.555, Lng: 0.600},  // West
 	}
 
 	// Create zones and assign their drivers in trap order (longest wait first)
@@ -287,6 +291,7 @@ var indexTmpl = template.Must(template.New("index").Funcs(template.FuncMap{
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Southend Taxi Co-op - Dispatch Demo</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;padding:28px;max-width:1100px;margin:0 auto}
@@ -322,6 +327,9 @@ button:hover{background:#1976d2}
 .log-status-declined{color:#ef5350;text-align:right}
 .log-status-offered{color:#ffa726;text-align:right}
 .no-jobs{color:#37474f;font-style:italic;font-size:.82rem}
+#map{width:100%;height:450px;border-radius:8px;border:1px solid #1e2a3a}
+.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#1a1a2e;color:#e0e0e0;border:1px solid #2a3a4a}
+.leaflet-popup-content b{color:#4fc3f7}
 </style>
 </head>
 <body>
@@ -341,6 +349,9 @@ button:hover{background:#1976d2}
 </div>
 {{end}}
 </div>
+
+<h2>Live Driver Map</h2>
+<div id="map"></div>
 
 <h2>New Booking</h2>
 <div class="form-card">
@@ -371,9 +382,75 @@ button:hover{background:#1976d2}
   </div>{{end}}
   {{else}}<p class="no-jobs">No dispatches yet</p>{{end}}
 </div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const map = L.map('map').setView([51.538, 0.711], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors',
+  maxZoom: 18
+}).addTo(map);
+
+const driversLayer = L.layerGroup().addTo(map);
+
+function refreshDrivers() {
+  fetch('/api/drivers')
+    .then(r => r.json())
+    .then(drivers => {
+      driversLayer.clearLayers();
+      drivers.forEach(d => {
+        L.circleMarker([d.lat, d.lng], {
+          radius: 9,
+          fillColor: d.status === 'available' ? '#4caf50' : '#f44336',
+          color: '#ffffff',
+          weight: 2,
+          opacity: 1,
+          fillOpacity: 0.85
+        })
+        .bindPopup('<b>' + d.name + '</b><br>' + d.zone + ' zone<br>' + d.status)
+        .addTo(driversLayer);
+      });
+    })
+    .catch(() => {}); // silently ignore network errors during refresh
+}
+
+refreshDrivers();
+setInterval(refreshDrivers, 5000);
+</script>
 </body>
 </html>
 `))
+
+// handleDriverData returns all drivers as JSON for the live map.
+func handleDriverData(w http.ResponseWriter, r *http.Request) {
+	type driverJSON struct {
+		Name   string  `json:"name"`
+		Status string  `json:"status"`
+		Zone   string  `json:"zone"`
+		Lat    float64 `json:"lat"`
+		Lng    float64 `json:"lng"`
+	}
+
+	data := make([]driverJSON, 0, len(appState.Drivers))
+	for _, d := range appState.Drivers {
+		zoneName := d.ZoneID
+		for _, z := range appState.Zones {
+			if z.ID == d.ZoneID {
+				zoneName = z.Name
+				break
+			}
+		}
+		data = append(data, driverJSON{
+			Name:   d.Name,
+			Status: string(d.Status),
+			Zone:   zoneName,
+			Lat:    d.Lat,
+			Lng:    d.Lng,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
 
 // handleIndex renders the main dispatch UI.
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -425,6 +502,7 @@ func main() {
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/dispatch", handleDispatch)
+	http.HandleFunc("/api/drivers", handleDriverData)
 
 	fmt.Println("Server starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
