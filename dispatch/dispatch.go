@@ -14,6 +14,37 @@ import (
 	"taxidemo/models"
 )
 
+// destination represents a named drop-off point with GPS coordinates.
+type destination struct {
+	Name string
+	Lat  float64
+	Lng  float64
+}
+
+// destinations is the list of common Southend drop-off points used for random assignment.
+var destinations = []destination{
+	{"Southend Central Station", 51.536, 0.708},
+	{"Southend Victoria Station", 51.538, 0.713},
+	{"Southend Airport", 51.571, 0.695},
+	{"Southend Hospital", 51.549, 0.698},
+	{"Southend Seafront", 51.530, 0.717},
+	{"Westcliff Station", 51.537, 0.678},
+	{"Leigh-on-Sea Station", 51.540, 0.658},
+	{"Rochford Station", 51.581, 0.708},
+	{"Shoeburyness Station", 51.531, 0.798},
+	{"Thorpe Bay Station", 51.532, 0.762},
+	{"Victoria Shopping Centre", 51.537, 0.711},
+	{"Priory Park", 51.547, 0.717},
+	{"Adventure Island", 51.531, 0.720},
+	{"Kursaal", 51.532, 0.718},
+	{"London Road shops", 51.548, 0.678},
+}
+
+// randomDestination returns a randomly chosen destination from the list.
+func randomDestination() destination {
+	return destinations[rand.Intn(len(destinations))]
+}
+
 // zoneCoords maps zone IDs to their approximate centre coordinates.
 var zoneCoords = map[string][2]float64{
 	"Z01": {51.568, 0.672}, // Progress
@@ -83,6 +114,14 @@ func DispatchJob(booking *models.Booking, zones []*models.Zone) *models.Job {
 
 	// Assign pickup coordinates based on zone, with a small random offset.
 	booking.Lat, booking.Lng = bookingCoords(booking.PickupZone)
+
+	// Assign a random destination if one hasn't been set.
+	if booking.Destination == "" {
+		dest := randomDestination()
+		booking.Destination = dest.Name
+		booking.DestLat = dest.Lat
+		booking.DestLng = dest.Lng
+	}
 
 	job := &models.Job{
 		ID:        "J-" + booking.ID,

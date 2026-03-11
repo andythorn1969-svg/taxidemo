@@ -159,6 +159,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 const driversLayer = L.layerGroup().addTo(map);
 const bookingsLayer = L.layerGroup().addTo(map);
+const bookingLinesLayer = L.layerGroup().addTo(map);
 const zonesLayer = L.layerGroup().addTo(map);
 
 const zoneColors = [
@@ -244,24 +245,49 @@ function refreshBookings() {
     .then(r => r.json())
     .then(bookings => {
       bookingsLayer.clearLayers();
+      bookingLinesLayer.clearLayers();
       bookings.forEach(b => {
         const driver = b.driver ? b.driver : 'Unassigned';
         const dest = b.destination ? b.destination : 'Not specified';
+        const popup =
+          '<b>' + b.passenger + '</b><br>' +
+          'To: ' + dest + '<br>' +
+          'Driver: ' + driver + '<br>' +
+          'Status: ' + b.status;
+
+        // Blue pickup marker
         L.circleMarker([b.lat, b.lng], {
-          radius: 12,
+          radius: 10,
           fillColor: '#1565c0',
           color: '#90caf9',
           weight: 2,
           opacity: 1,
-          fillOpacity: 0.75
+          fillOpacity: 0.85
         })
-        .bindPopup(
-          '<b>' + b.passenger + '</b><br>' +
-          'To: ' + dest + '<br>' +
-          'Driver: ' + driver + '<br>' +
-          'Status: ' + b.status
-        )
+        .bindPopup(popup)
         .addTo(bookingsLayer);
+
+        // Purple destination marker and dashed line (when coordinates are set)
+        if (b.dest_lat && b.dest_lng) {
+          L.circleMarker([b.dest_lat, b.dest_lng], {
+            radius: 10,
+            fillColor: '#7b1fa2',
+            color: '#ce93d8',
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.85
+          })
+          .bindPopup(popup)
+          .addTo(bookingsLayer);
+
+          L.polyline([[b.lat, b.lng], [b.dest_lat, b.dest_lng]], {
+            color: '#ce93d8',
+            weight: 2,
+            opacity: 0.7,
+            dashArray: '6, 6'
+          })
+          .addTo(bookingLinesLayer);
+        }
       });
     })
     .catch(() => {});
@@ -321,6 +347,8 @@ func HandleBookingData(w http.ResponseWriter, r *http.Request) {
 		Status      string  `json:"status"`
 		Lat         float64 `json:"lat"`
 		Lng         float64 `json:"lng"`
+		DestLat     float64 `json:"dest_lat"`
+		DestLng     float64 `json:"dest_lng"`
 	}
 
 	data := make([]bookingJSON, 0, len(AppState.Jobs))
@@ -345,6 +373,8 @@ func HandleBookingData(w http.ResponseWriter, r *http.Request) {
 			Status:      string(j.Status),
 			Lat:         j.Booking.Lat,
 			Lng:         j.Booking.Lng,
+			DestLat:     j.Booking.DestLat,
+			DestLng:     j.Booking.DestLng,
 		})
 	}
 

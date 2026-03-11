@@ -63,6 +63,8 @@ type Booking struct {
 	CreatedAt   time.Time
 	Lat         float64 // pickup GPS latitude
 	Lng         float64 // pickup GPS longitude
+	DestLat     float64 // destination GPS latitude
+	DestLng     float64 // destination GPS longitude
 }
 
 // JobStatus tracks the offer/response lifecycle.
