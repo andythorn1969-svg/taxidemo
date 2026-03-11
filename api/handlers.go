@@ -158,6 +158,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 }).addTo(map);
 
 const driversLayer = L.layerGroup().addTo(map);
+const bookingsLayer = L.layerGroup().addTo(map);
 
 function refreshDrivers() {
   fetch('/api/drivers')
@@ -177,11 +178,41 @@ function refreshDrivers() {
         .addTo(driversLayer);
       });
     })
-    .catch(() => {}); // silently ignore network errors during refresh
+    .catch(() => {});
+}
+
+function refreshBookings() {
+  fetch('/api/bookings')
+    .then(r => r.json())
+    .then(bookings => {
+      bookingsLayer.clearLayers();
+      bookings.forEach(b => {
+        const driver = b.driver ? b.driver : 'Unassigned';
+        const dest = b.destination ? b.destination : 'Not specified';
+        L.circleMarker([b.lat, b.lng], {
+          radius: 12,
+          fillColor: '#1565c0',
+          color: '#90caf9',
+          weight: 2,
+          opacity: 1,
+          fillOpacity: 0.75
+        })
+        .bindPopup(
+          '<b>' + b.passenger + '</b><br>' +
+          'To: ' + dest + '<br>' +
+          'Driver: ' + driver + '<br>' +
+          'Status: ' + b.status
+        )
+        .addTo(bookingsLayer);
+      });
+    })
+    .catch(() => {});
 }
 
 refreshDrivers();
+refreshBookings();
 setInterval(refreshDrivers, 5000);
+setInterval(refreshBookings, 5000);
 </script>
 </body>
 </html>
@@ -212,6 +243,48 @@ func HandleDriverData(w http.ResponseWriter, r *http.Request) {
 			Zone:   zoneName,
 			Lat:    d.Lat,
 			Lng:    d.Lng,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+// HandleBookingData returns all active jobs as JSON for the live map.
+func HandleBookingData(w http.ResponseWriter, r *http.Request) {
+	type bookingJSON struct {
+		ID          string  `json:"id"`
+		Passenger   string  `json:"passenger"`
+		Zone        string  `json:"zone"`
+		Destination string  `json:"destination"`
+		Driver      string  `json:"driver"`
+		Status      string  `json:"status"`
+		Lat         float64 `json:"lat"`
+		Lng         float64 `json:"lng"`
+	}
+
+	data := make([]bookingJSON, 0, len(AppState.Jobs))
+	for _, j := range AppState.Jobs {
+		driverName := ""
+		if j.Driver != nil {
+			driverName = j.Driver.Name
+		}
+		zoneName := j.Booking.PickupZone
+		for _, z := range AppState.Zones {
+			if z.ID == j.Booking.PickupZone {
+				zoneName = z.Name
+				break
+			}
+		}
+		data = append(data, bookingJSON{
+			ID:          j.Booking.ID,
+			Passenger:   j.Booking.Passenger,
+			Zone:        zoneName,
+			Destination: j.Booking.Destination,
+			Driver:      driverName,
+			Status:      string(j.Status),
+			Lat:         j.Booking.Lat,
+			Lng:         j.Booking.Lng,
 		})
 	}
 

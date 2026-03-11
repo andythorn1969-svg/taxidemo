@@ -8,10 +8,48 @@ package dispatch
 
 import (
 	"fmt"
+	"math/rand"
 	"time"
 
 	"taxidemo/models"
 )
+
+// zoneCoords maps zone IDs to their approximate centre coordinates.
+var zoneCoords = map[string][2]float64{
+	"Z01": {51.568, 0.672}, // Progress
+	"Z02": {51.565, 0.700}, // Thanet
+	"Z03": {51.563, 0.730}, // Blue
+	"Z04": {51.558, 0.660}, // Fairway
+	"Z05": {51.556, 0.690}, // Blenheim
+	"Z06": {51.556, 0.718}, // Temple
+	"Z07": {51.554, 0.740}, // Fossett
+	"Z08": {51.549, 0.648}, // Highlands
+	"Z09": {51.548, 0.672}, // Elms
+	"Z10": {51.547, 0.695}, // Ross
+	"Z11": {51.545, 0.708}, // Plough
+	"Z12": {51.544, 0.720}, // Priory
+	"Z13": {51.543, 0.735}, // VAC
+	"Z14": {51.541, 0.748}, // Green
+	"Z15": {51.540, 0.645}, // Broadway
+	"Z16": {51.537, 0.660}, // Chalkwell
+	"Z17": {51.535, 0.678}, // Westcliff
+	"Z18": {51.533, 0.708}, // Town
+	"Z19": {51.531, 0.722}, // Kursaal
+	"Z20": {51.530, 0.740}, // Thorpe
+	"Z21": {51.528, 0.755}, // Bay
+	"Z22": {51.527, 0.775}, // Shoebury
+}
+
+// bookingCoords returns coordinates for a booking based on its pickup zone,
+// with a small random offset so multiple bookings don't stack.
+func bookingCoords(zoneID string) (float64, float64) {
+	centre, ok := zoneCoords[zoneID]
+	if !ok {
+		return 51.538, 0.711 // fall back to Southend centre
+	}
+	offset := func() float64 { return (rand.Float64()*2 - 1) * 0.003 }
+	return centre[0] + offset(), centre[1] + offset()
+}
 
 // FindZone returns the zone matching the given ID, or nil if not found.
 func FindZone(id string, zones []*models.Zone) *models.Zone {
@@ -42,6 +80,9 @@ func FindNearestDriver(zones []*models.Zone) *models.Driver {
 // Returns a Job reflecting the final outcome.
 func DispatchJob(booking *models.Booking, zones []*models.Zone) *models.Job {
 	zone := FindZone(booking.PickupZone, zones)
+
+	// Assign pickup coordinates based on zone, with a small random offset.
+	booking.Lat, booking.Lng = bookingCoords(booking.PickupZone)
 
 	job := &models.Job{
 		ID:        "J-" + booking.ID,
