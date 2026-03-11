@@ -6,7 +6,10 @@
 
 package models
 
-import "time"
+import (
+	"math/rand"
+	"time"
+)
 
 // DriverStatus represents whether a driver is free or occupied.
 type DriverStatus string
@@ -18,13 +21,14 @@ const (
 
 // Driver represents a taxi driver in the cooperative.
 type Driver struct {
-	ID     string
-	Name   string
-	ZoneID string
-	Status DriverStatus
-	FreeAt time.Time // when they became available - determines trap position
-	Lat    float64   // GPS latitude
-	Lng    float64   // GPS longitude
+	ID          string
+	Name        string
+	ZoneID      string
+	Status      DriverStatus
+	FreeAt      time.Time // when they became available - determines trap position
+	Lat         float64   // GPS latitude
+	Lng         float64   // GPS longitude
+	PlateNumber int       // cooperative cab number (1-500)
 }
 
 // Zone represents a geographic dispatch area with an ordered trap queue.
@@ -89,63 +93,64 @@ type Job struct {
 // SeedData creates the initial zones and drivers for the demo.
 func SeedData() ([]*Zone, []*Driver) {
 	now := time.Now()
+	plate := func() int { return rand.Intn(500) + 1 }
 
 	// 30 drivers spread across 22 real Southend Taxi Cooperative zones.
 	// FreeAt times vary to simulate realistic trap queue positions.
 	// Coordinates are near each zone centre with small offsets.
 	drivers := []*Driver{
 		// Z01 Progress
-		{ID: "D01", Name: "Alice Brown", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-55 * time.Minute), Lat: 51.569, Lng: 0.671},
-		{ID: "D02", Name: "Bob Carter", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-32 * time.Minute), Lat: 51.567, Lng: 0.674},
+		{ID: "D01", Name: "Alice Brown", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-55 * time.Minute), Lat: 51.569, Lng: 0.671, PlateNumber: plate()},
+		{ID: "D02", Name: "Bob Carter", ZoneID: "Z01", Status: StatusAvailable, FreeAt: now.Add(-32 * time.Minute), Lat: 51.567, Lng: 0.674, PlateNumber: plate()},
 		// Z02 Thanet
-		{ID: "D03", Name: "Carol Davies", ZoneID: "Z02", Status: StatusAvailable, FreeAt: now.Add(-48 * time.Minute), Lat: 51.566, Lng: 0.701},
+		{ID: "D03", Name: "Carol Davies", ZoneID: "Z02", Status: StatusAvailable, FreeAt: now.Add(-48 * time.Minute), Lat: 51.566, Lng: 0.701, PlateNumber: plate()},
 		// Z03 Blue
-		{ID: "D04", Name: "Dave Ellis", ZoneID: "Z03", Status: StatusAvailable, FreeAt: now.Add(-20 * time.Minute), Lat: 51.562, Lng: 0.731},
+		{ID: "D04", Name: "Dave Ellis", ZoneID: "Z03", Status: StatusAvailable, FreeAt: now.Add(-20 * time.Minute), Lat: 51.562, Lng: 0.731, PlateNumber: plate()},
 		// Z04 Fairway
-		{ID: "D05", Name: "Emma Foster", ZoneID: "Z04", Status: StatusAvailable, FreeAt: now.Add(-70 * time.Minute), Lat: 51.559, Lng: 0.659},
-		{ID: "D06", Name: "Frank Green", ZoneID: "Z04", Status: StatusAvailable, FreeAt: now.Add(-40 * time.Minute), Lat: 51.557, Lng: 0.661},
+		{ID: "D05", Name: "Emma Foster", ZoneID: "Z04", Status: StatusAvailable, FreeAt: now.Add(-70 * time.Minute), Lat: 51.559, Lng: 0.659, PlateNumber: plate()},
+		{ID: "D06", Name: "Frank Green", ZoneID: "Z04", Status: StatusAvailable, FreeAt: now.Add(-40 * time.Minute), Lat: 51.557, Lng: 0.661, PlateNumber: plate()},
 		// Z05 Blenheim
-		{ID: "D07", Name: "Grace Hill", ZoneID: "Z05", Status: StatusAvailable, FreeAt: now.Add(-35 * time.Minute), Lat: 51.557, Lng: 0.691},
+		{ID: "D07", Name: "Grace Hill", ZoneID: "Z05", Status: StatusAvailable, FreeAt: now.Add(-35 * time.Minute), Lat: 51.557, Lng: 0.691, PlateNumber: plate()},
 		// Z06 Temple
-		{ID: "D08", Name: "Harry Irving", ZoneID: "Z06", Status: StatusBusy, FreeAt: now.Add(-10 * time.Minute), Lat: 51.557, Lng: 0.717},
-		{ID: "D09", Name: "Isla Jones", ZoneID: "Z06", Status: StatusAvailable, FreeAt: now.Add(-45 * time.Minute), Lat: 51.555, Lng: 0.719},
+		{ID: "D08", Name: "Harry Irving", ZoneID: "Z06", Status: StatusBusy, FreeAt: now.Add(-10 * time.Minute), Lat: 51.557, Lng: 0.717, PlateNumber: plate()},
+		{ID: "D09", Name: "Isla Jones", ZoneID: "Z06", Status: StatusAvailable, FreeAt: now.Add(-45 * time.Minute), Lat: 51.555, Lng: 0.719, PlateNumber: plate()},
 		// Z07 Fossett
-		{ID: "D10", Name: "Jack King", ZoneID: "Z07", Status: StatusAvailable, FreeAt: now.Add(-28 * time.Minute), Lat: 51.553, Lng: 0.741},
+		{ID: "D10", Name: "Jack King", ZoneID: "Z07", Status: StatusAvailable, FreeAt: now.Add(-28 * time.Minute), Lat: 51.553, Lng: 0.741, PlateNumber: plate()},
 		// Z08 Highlands
-		{ID: "D11", Name: "Karen Lee", ZoneID: "Z08", Status: StatusAvailable, FreeAt: now.Add(-62 * time.Minute), Lat: 51.550, Lng: 0.647},
+		{ID: "D11", Name: "Karen Lee", ZoneID: "Z08", Status: StatusAvailable, FreeAt: now.Add(-62 * time.Minute), Lat: 51.550, Lng: 0.647, PlateNumber: plate()},
 		// Z09 Elms
-		{ID: "D12", Name: "Liam Morris", ZoneID: "Z09", Status: StatusAvailable, FreeAt: now.Add(-38 * time.Minute), Lat: 51.549, Lng: 0.671},
-		{ID: "D13", Name: "Mia Nash", ZoneID: "Z09", Status: StatusAvailable, FreeAt: now.Add(-15 * time.Minute), Lat: 51.547, Lng: 0.673},
+		{ID: "D12", Name: "Liam Morris", ZoneID: "Z09", Status: StatusAvailable, FreeAt: now.Add(-38 * time.Minute), Lat: 51.549, Lng: 0.671, PlateNumber: plate()},
+		{ID: "D13", Name: "Mia Nash", ZoneID: "Z09", Status: StatusAvailable, FreeAt: now.Add(-15 * time.Minute), Lat: 51.547, Lng: 0.673, PlateNumber: plate()},
 		// Z10 Ross
-		{ID: "D14", Name: "Noah Owen", ZoneID: "Z10", Status: StatusAvailable, FreeAt: now.Add(-50 * time.Minute), Lat: 51.548, Lng: 0.696},
+		{ID: "D14", Name: "Noah Owen", ZoneID: "Z10", Status: StatusAvailable, FreeAt: now.Add(-50 * time.Minute), Lat: 51.548, Lng: 0.696, PlateNumber: plate()},
 		// Z11 Plough
-		{ID: "D15", Name: "Olivia Page", ZoneID: "Z11", Status: StatusAvailable, FreeAt: now.Add(-80 * time.Minute), Lat: 51.546, Lng: 0.707},
-		{ID: "D16", Name: "Peter Quinn", ZoneID: "Z11", Status: StatusAvailable, FreeAt: now.Add(-22 * time.Minute), Lat: 51.544, Lng: 0.709},
+		{ID: "D15", Name: "Olivia Page", ZoneID: "Z11", Status: StatusAvailable, FreeAt: now.Add(-80 * time.Minute), Lat: 51.546, Lng: 0.707, PlateNumber: plate()},
+		{ID: "D16", Name: "Peter Quinn", ZoneID: "Z11", Status: StatusAvailable, FreeAt: now.Add(-22 * time.Minute), Lat: 51.544, Lng: 0.709, PlateNumber: plate()},
 		// Z12 Priory
-		{ID: "D17", Name: "Rachel Reed", ZoneID: "Z12", Status: StatusAvailable, FreeAt: now.Add(-33 * time.Minute), Lat: 51.545, Lng: 0.721},
+		{ID: "D17", Name: "Rachel Reed", ZoneID: "Z12", Status: StatusAvailable, FreeAt: now.Add(-33 * time.Minute), Lat: 51.545, Lng: 0.721, PlateNumber: plate()},
 		// Z13 VAC
-		{ID: "D18", Name: "Sam Scott", ZoneID: "Z13", Status: StatusBusy, FreeAt: now.Add(-8 * time.Minute), Lat: 51.542, Lng: 0.736},
+		{ID: "D18", Name: "Sam Scott", ZoneID: "Z13", Status: StatusBusy, FreeAt: now.Add(-8 * time.Minute), Lat: 51.542, Lng: 0.736, PlateNumber: plate()},
 		// Z14 Green
-		{ID: "D19", Name: "Tina Turner", ZoneID: "Z14", Status: StatusAvailable, FreeAt: now.Add(-42 * time.Minute), Lat: 51.540, Lng: 0.749},
+		{ID: "D19", Name: "Tina Turner", ZoneID: "Z14", Status: StatusAvailable, FreeAt: now.Add(-42 * time.Minute), Lat: 51.540, Lng: 0.749, PlateNumber: plate()},
 		// Z15 Broadway
-		{ID: "D20", Name: "Umar Vance", ZoneID: "Z15", Status: StatusAvailable, FreeAt: now.Add(-58 * time.Minute), Lat: 51.541, Lng: 0.644},
-		{ID: "D21", Name: "Vera Walsh", ZoneID: "Z15", Status: StatusAvailable, FreeAt: now.Add(-18 * time.Minute), Lat: 51.539, Lng: 0.646},
+		{ID: "D20", Name: "Umar Vance", ZoneID: "Z15", Status: StatusAvailable, FreeAt: now.Add(-58 * time.Minute), Lat: 51.541, Lng: 0.644, PlateNumber: plate()},
+		{ID: "D21", Name: "Vera Walsh", ZoneID: "Z15", Status: StatusAvailable, FreeAt: now.Add(-18 * time.Minute), Lat: 51.539, Lng: 0.646, PlateNumber: plate()},
 		// Z16 Chalkwell
-		{ID: "D22", Name: "Will Cross", ZoneID: "Z16", Status: StatusAvailable, FreeAt: now.Add(-44 * time.Minute), Lat: 51.538, Lng: 0.659},
+		{ID: "D22", Name: "Will Cross", ZoneID: "Z16", Status: StatusAvailable, FreeAt: now.Add(-44 * time.Minute), Lat: 51.538, Lng: 0.659, PlateNumber: plate()},
 		// Z17 Westcliff
-		{ID: "D23", Name: "Xena Dale", ZoneID: "Z17", Status: StatusAvailable, FreeAt: now.Add(-65 * time.Minute), Lat: 51.536, Lng: 0.677},
-		{ID: "D24", Name: "Yusuf Evans", ZoneID: "Z17", Status: StatusAvailable, FreeAt: now.Add(-27 * time.Minute), Lat: 51.534, Lng: 0.679},
+		{ID: "D23", Name: "Xena Dale", ZoneID: "Z17", Status: StatusAvailable, FreeAt: now.Add(-65 * time.Minute), Lat: 51.536, Lng: 0.677, PlateNumber: plate()},
+		{ID: "D24", Name: "Yusuf Evans", ZoneID: "Z17", Status: StatusAvailable, FreeAt: now.Add(-27 * time.Minute), Lat: 51.534, Lng: 0.679, PlateNumber: plate()},
 		// Z18 Town
-		{ID: "D25", Name: "Zoe Ford", ZoneID: "Z18", Status: StatusAvailable, FreeAt: now.Add(-90 * time.Minute), Lat: 51.534, Lng: 0.707},
-		{ID: "D26", Name: "Aaron Gray", ZoneID: "Z18", Status: StatusAvailable, FreeAt: now.Add(-36 * time.Minute), Lat: 51.532, Lng: 0.709},
+		{ID: "D25", Name: "Zoe Ford", ZoneID: "Z18", Status: StatusAvailable, FreeAt: now.Add(-90 * time.Minute), Lat: 51.534, Lng: 0.707, PlateNumber: plate()},
+		{ID: "D26", Name: "Aaron Gray", ZoneID: "Z18", Status: StatusAvailable, FreeAt: now.Add(-36 * time.Minute), Lat: 51.532, Lng: 0.709, PlateNumber: plate()},
 		// Z19 Kursaal
-		{ID: "D27", Name: "Beth Hunt", ZoneID: "Z19", Status: StatusAvailable, FreeAt: now.Add(-52 * time.Minute), Lat: 51.532, Lng: 0.723},
+		{ID: "D27", Name: "Beth Hunt", ZoneID: "Z19", Status: StatusAvailable, FreeAt: now.Add(-52 * time.Minute), Lat: 51.532, Lng: 0.723, PlateNumber: plate()},
 		// Z20 Thorpe
-		{ID: "D28", Name: "Colin Irons", ZoneID: "Z20", Status: StatusAvailable, FreeAt: now.Add(-30 * time.Minute), Lat: 51.529, Lng: 0.741},
+		{ID: "D28", Name: "Colin Irons", ZoneID: "Z20", Status: StatusAvailable, FreeAt: now.Add(-30 * time.Minute), Lat: 51.529, Lng: 0.741, PlateNumber: plate()},
 		// Z21 Bay
-		{ID: "D29", Name: "Donna Jay", ZoneID: "Z21", Status: StatusAvailable, FreeAt: now.Add(-47 * time.Minute), Lat: 51.527, Lng: 0.756},
+		{ID: "D29", Name: "Donna Jay", ZoneID: "Z21", Status: StatusAvailable, FreeAt: now.Add(-47 * time.Minute), Lat: 51.527, Lng: 0.756, PlateNumber: plate()},
 		// Z22 Shoebury
-		{ID: "D30", Name: "Eddie Kane", ZoneID: "Z22", Status: StatusAvailable, FreeAt: now.Add(-25 * time.Minute), Lat: 51.528, Lng: 0.774},
+		{ID: "D30", Name: "Eddie Kane", ZoneID: "Z22", Status: StatusAvailable, FreeAt: now.Add(-25 * time.Minute), Lat: 51.528, Lng: 0.774, PlateNumber: plate()},
 	}
 
 	zones := []*Zone{
