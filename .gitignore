@@ -1,0 +1,9 @@
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build cache
+/vendor/
