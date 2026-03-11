@@ -159,6 +159,64 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 const driversLayer = L.layerGroup().addTo(map);
 const bookingsLayer = L.layerGroup().addTo(map);
+const zonesLayer = L.layerGroup().addTo(map);
+
+const zoneColors = [
+  '#e74c3c','#e67e22','#f1c40f','#2ecc71','#1abc9c',
+  '#3498db','#9b59b6','#e91e63','#ff5722','#8bc34a',
+  '#00bcd4','#673ab7','#ff9800','#4caf50','#2196f3',
+  '#f44336','#009688','#cddc39','#ff4081','#7c4dff',
+  '#64ffda','#ffd740'
+];
+
+const zoneBounds = [
+  {id:'Z01',name:'Progress',  coords:[[51.572,0.658],[51.572,0.688],[51.562,0.688],[51.562,0.658]]},
+  {id:'Z02',name:'Thanet',    coords:[[51.572,0.688],[51.572,0.718],[51.562,0.718],[51.562,0.688]]},
+  {id:'Z03',name:'Blue',      coords:[[51.572,0.718],[51.572,0.748],[51.562,0.748],[51.562,0.718]]},
+  {id:'Z04',name:'Fairway',   coords:[[51.562,0.648],[51.562,0.678],[51.552,0.678],[51.552,0.648]]},
+  {id:'Z05',name:'Blenheim',  coords:[[51.562,0.678],[51.562,0.708],[51.552,0.708],[51.552,0.678]]},
+  {id:'Z06',name:'Temple',    coords:[[51.562,0.708],[51.562,0.738],[51.552,0.738],[51.552,0.708]]},
+  {id:'Z07',name:'Fossett',   coords:[[51.562,0.738],[51.562,0.758],[51.552,0.758],[51.552,0.738]]},
+  {id:'Z08',name:'Highlands', coords:[[51.552,0.638],[51.552,0.665],[51.542,0.665],[51.542,0.638]]},
+  {id:'Z09',name:'Elms',      coords:[[51.552,0.665],[51.552,0.688],[51.542,0.688],[51.542,0.665]]},
+  {id:'Z10',name:'Ross',      coords:[[51.552,0.688],[51.552,0.708],[51.542,0.708],[51.542,0.688]]},
+  {id:'Z11',name:'Plough',    coords:[[51.552,0.708],[51.552,0.725],[51.542,0.725],[51.542,0.708]]},
+  {id:'Z12',name:'Priory',    coords:[[51.552,0.725],[51.552,0.745],[51.542,0.745],[51.542,0.725]]},
+  {id:'Z13',name:'VAC',       coords:[[51.552,0.745],[51.552,0.762],[51.542,0.762],[51.542,0.745]]},
+  {id:'Z14',name:'Green',     coords:[[51.552,0.762],[51.552,0.778],[51.542,0.778],[51.542,0.762]]},
+  {id:'Z15',name:'Broadway',  coords:[[51.542,0.635],[51.542,0.660],[51.532,0.660],[51.532,0.635]]},
+  {id:'Z16',name:'Chalkwell', coords:[[51.542,0.648],[51.542,0.672],[51.530,0.672],[51.530,0.648]]},
+  {id:'Z17',name:'Westcliff', coords:[[51.542,0.672],[51.542,0.695],[51.528,0.695],[51.528,0.672]]},
+  {id:'Z18',name:'Town',      coords:[[51.542,0.695],[51.542,0.722],[51.528,0.722],[51.528,0.695]]},
+  {id:'Z19',name:'Kursaal',   coords:[[51.542,0.722],[51.542,0.742],[51.528,0.742],[51.528,0.722]]},
+  {id:'Z20',name:'Thorpe',    coords:[[51.542,0.742],[51.542,0.762],[51.528,0.762],[51.528,0.742]]},
+  {id:'Z21',name:'Bay',       coords:[[51.535,0.762],[51.535,0.785],[51.522,0.785],[51.522,0.762]]},
+  {id:'Z22',name:'Shoebury',  coords:[[51.535,0.785],[51.535,0.810],[51.522,0.810],[51.522,0.785]]},
+];
+
+function refreshZones() {
+  fetch('/api/zones')
+    .then(r => r.json())
+    .then(zones => {
+      const countMap = {};
+      zones.forEach(z => { countMap[z.id] = z.driver_count; });
+      zonesLayer.clearLayers();
+      zoneBounds.forEach((z, i) => {
+        const color = zoneColors[i % zoneColors.length];
+        const count = countMap[z.id] !== undefined ? countMap[z.id] : 0;
+        L.polygon(z.coords, {
+          color: color,
+          weight: 2,
+          opacity: 0.8,
+          fillColor: color,
+          fillOpacity: 0.2
+        })
+        .bindPopup('<b>' + z.name + '</b><br>Drivers: ' + count)
+        .addTo(zonesLayer);
+      });
+    })
+    .catch(() => {});
+}
 
 function refreshDrivers() {
   fetch('/api/drivers')
@@ -209,8 +267,10 @@ function refreshBookings() {
     .catch(() => {});
 }
 
+refreshZones();
 refreshDrivers();
 refreshBookings();
+setInterval(refreshZones, 5000);
 setInterval(refreshDrivers, 5000);
 setInterval(refreshBookings, 5000);
 </script>
@@ -285,6 +345,33 @@ func HandleBookingData(w http.ResponseWriter, r *http.Request) {
 			Status:      string(j.Status),
 			Lat:         j.Booking.Lat,
 			Lng:         j.Booking.Lng,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+// HandleZoneData returns all zones with their current driver counts as JSON.
+func HandleZoneData(w http.ResponseWriter, r *http.Request) {
+	type zoneJSON struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		DriverCount int    `json:"driver_count"`
+	}
+
+	data := make([]zoneJSON, 0, len(AppState.Zones))
+	for _, z := range AppState.Zones {
+		available := 0
+		for _, d := range z.Drivers {
+			if d.Status == models.StatusAvailable {
+				available++
+			}
+		}
+		data = append(data, zoneJSON{
+			ID:          z.ID,
+			Name:        z.Name,
+			DriverCount: available,
 		})
 	}
 

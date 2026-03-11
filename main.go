@@ -21,6 +21,7 @@ func main() {
 	http.HandleFunc("/dispatch", api.HandleDispatch)
 	http.HandleFunc("/api/drivers", api.HandleDriverData)
 	http.HandleFunc("/api/bookings", api.HandleBookingData)
+	http.HandleFunc("/api/zones", api.HandleZoneData)
 
 	fmt.Println("Server starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
