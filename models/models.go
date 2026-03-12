@@ -8,6 +8,7 @@ package models
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -33,10 +34,19 @@ type Driver struct {
 
 // Zone represents a geographic dispatch area with an ordered trap queue.
 type Zone struct {
-	ID      string
-	Name    string
-	Drivers []*Driver // ordered slice - index 0 is trap 1
+	ID                     string
+	Name                   string
+	Drivers                []*Driver // ordered slice - index 0 is trap 1
+	AverageApproachMinutes int
 }
+
+// BookingType distinguishes immediate bookings from pre-booked ones.
+type BookingType string
+
+const (
+	BookingImmediate BookingType = "immediate"
+	BookingPrebook   BookingType = "prebook"
+)
 
 // BookingStatus tracks where a booking is in its lifecycle.
 type BookingStatus string
@@ -58,17 +68,26 @@ const (
 
 // Booking represents a passenger's request for a taxi.
 type Booking struct {
-	ID          string
-	Passenger   string
-	PickupZone  string
-	Destination string
-	Source      BookingSource
-	Status      BookingStatus
-	CreatedAt   time.Time
-	Lat         float64 // pickup GPS latitude
-	Lng         float64 // pickup GPS longitude
-	DestLat     float64 // destination GPS latitude
-	DestLng     float64 // destination GPS longitude
+	ID            string
+	Passenger     string
+	PickupZone    string
+	Destination   string
+	Source        BookingSource
+	Status        BookingStatus
+	CreatedAt     time.Time
+	Lat           float64 // pickup GPS latitude
+	Lng           float64 // pickup GPS longitude
+	DestLat       float64 // destination GPS latitude
+	DestLng       float64 // destination GPS longitude
+	Type          BookingType
+	CustomerName  string
+	Phone         string
+	Notes         string
+	IsAccount     bool
+	PickupAddress string
+	DestAddress   string
+	RequestedTime time.Time
+	CompletedAt   *time.Time
 }
 
 // JobStatus tracks the offer/response lifecycle.
@@ -88,6 +107,26 @@ type Job struct {
 	Driver    *Driver
 	Status    JobStatus
 	OfferedAt time.Time
+}
+
+// Customer represents a known passenger, potentially an account holder.
+type Customer struct {
+	ID                    string
+	Name                  string
+	Phone                 string
+	Address               string
+	Notes                 string
+	FavouriteDestinations []string
+	IsAccount             bool
+}
+
+// AppState holds all runtime state for the dispatch system.
+type AppState struct {
+	Mu       sync.RWMutex
+	Drivers  []*Driver
+	Zones    []*Zone
+	Bookings []*Booking
+	Jobs     []*Job
 }
 
 // SeedData creates the initial zones and drivers for the demo.

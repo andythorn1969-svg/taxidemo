@@ -15,16 +15,18 @@ import (
 )
 
 func main() {
-	api.AppState.Zones, api.AppState.Drivers = models.SeedData()
+	zones, drivers := models.SeedData()
+	state := &models.AppState{
+		Zones:   zones,
+		Drivers: drivers,
+	}
 
-	http.HandleFunc("/", api.HandleIndex)
-	http.HandleFunc("/dispatch", api.HandleDispatch)
-	http.HandleFunc("/api/drivers", api.HandleDriverData)
-	http.HandleFunc("/api/bookings", api.HandleBookingData)
-	http.HandleFunc("/api/zones", api.HandleZoneData)
+	mux := http.NewServeMux()
+	h := &api.Handler{State: state}
+	h.RegisterRoutes(mux)
 
 	fmt.Println("Server starting on http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Printf("Server error: %v\n", err)
 	}
 }

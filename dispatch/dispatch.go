@@ -8,7 +8,10 @@ package dispatch
 
 import (
 	"fmt"
+	"log"
+	"math"
 	"math/rand"
+	"sync"
 	"time"
 
 	"taxidemo/models"
@@ -80,6 +83,26 @@ func bookingCoords(zoneID string) (float64, float64) {
 	}
 	offset := func() float64 { return (rand.Float64()*2 - 1) * 0.003 }
 	return centre[0] + offset(), centre[1] + offset()
+}
+
+// NearestZone returns the zone ID whose centre coordinate is closest to (lat, lng).
+// Falls back to "Z18" (Town — central Southend) if zoneCoords is empty.
+func NearestZone(lat, lng float64) string {
+	best := ""
+	bestDist := math.MaxFloat64
+	for id, centre := range zoneCoords {
+		dlat := lat - centre[0]
+		dlng := lng - centre[1]
+		dist := dlat*dlat + dlng*dlng
+		if dist < bestDist {
+			bestDist = dist
+			best = id
+		}
+	}
+	if best == "" {
+		return "Z18"
+	}
+	return best
 }
 
 // FindZone returns the zone matching the given ID, or nil if not found.
@@ -202,3 +225,137 @@ func zoneNameForDriver(driver *models.Driver, zones []*models.Zone) string {
 	}
 	return driver.ZoneID
 }
+
+// GenerateID returns a unique string ID with the given prefix.
+func GenerateID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// CompleteBooking marks a booking as completed and returns its driver to available status.
+// The driver reference is resolved through the matching Job record.
+func CompleteBooking(bookingID string, state *models.AppState) error {
+	state.Mu.Lock()
+	defer state.Mu.Unlock()
+
+	// Find the booking.
+	var booking *models.Booking
+	for _, b := range state.Bookings {
+		if b.ID == bookingID {
+			booking = b
+			break
+		}
+	}
+	if booking == nil {
+		return fmt.Errorf("booking %q not found", bookingID)
+	}
+
+	now := time.Now()
+	booking.Status = models.BookingCompleted
+	booking.CompletedAt = &now
+
+	// Find the job to get the assigned driver.
+	for _, j := range state.Jobs {
+		if j.Booking.ID == bookingID && j.Driver != nil {
+			// Return the driver to available status.
+			for _, d := range state.Drivers {
+				if d.ID == j.Driver.ID {
+					d.Status = models.StatusAvailable
+					d.FreeAt = now
+					break
+				}
+			}
+			break
+		}
+	}
+
+	return nil
+}
+
+// CancelBooking marks a booking as cancelled and frees any assigned driver.
+func CancelBooking(bookingID string, state *models.AppState) error {
+	state.Mu.Lock()
+	defer state.Mu.Unlock()
+
+	var booking *models.Booking
+	for _, b := range state.Bookings {
+		if b.ID == bookingID {
+			booking = b
+			break
+		}
+	}
+	if booking == nil {
+		return fmt.Errorf("booking %q not found", bookingID)
+	}
+
+	booking.Status = models.BookingCancelled
+
+	// If a driver was assigned via a job, free them.
+	for _, j := range state.Jobs {
+		if j.Booking.ID == bookingID && j.Driver != nil {
+			for _, d := range state.Drivers {
+				if d.ID == j.Driver.ID {
+					d.Status = models.StatusAvailable
+					d.FreeAt = time.Now()
+					break
+				}
+			}
+			break
+		}
+	}
+
+	return nil
+}
+
+// approachMinutesForZone returns how many minutes before RequestedTime to dispatch a prebook.
+// Uses the zone's AverageApproachMinutes, defaulting to 10 if the zone is not found.
+func approachMinutesForZone(zoneID string, state *models.AppState) int {
+	for _, z := range state.Zones {
+		if z.ID == zoneID {
+			return z.AverageApproachMinutes
+		}
+	}
+	log.Printf("approachMinutesForZone: zone %q not found, using default 10 mins", zoneID)
+	return 10
+}
+
+// runSchedulerCycle checks all pending prebooks and dispatches any that are due.
+func runSchedulerCycle(state *models.AppState) {
+	now := time.Now()
+
+	// Collect due prebooks under a read lock.
+	state.Mu.RLock()
+	var due []*models.Booking
+	for _, b := range state.Bookings {
+		if b.Type == models.BookingPrebook && b.Status == models.BookingPending {
+			approachMins := approachMinutesForZone(b.PickupZone, state)
+			dispatchTime := b.RequestedTime.Add(-time.Duration(approachMins) * time.Minute)
+			if !now.Before(dispatchTime) {
+				due = append(due, b)
+			}
+		}
+	}
+	state.Mu.RUnlock()
+
+	// Dispatch each due booking outside the read lock.
+	for _, b := range due {
+		job := DispatchJob(b, state.Zones)
+		log.Printf("scheduler: dispatched prebook %s — job %s status=%s", b.ID, job.ID, job.Status)
+	}
+}
+
+// StartScheduler launches a background goroutine that checks for due prebooks every 60 seconds.
+func StartScheduler(state *models.AppState) {
+	log.Println("dispatch scheduler started (60s interval)")
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			runSchedulerCycle(state)
+		}
+	}()
+}
+
+// Ensure math and sync are used; these are referenced by callers building on this package.
+// math.Round is available for future geo-distance work; sync.Once is used in AppState.Mu.
+var _ = math.Round
+var _ sync.Mutex
