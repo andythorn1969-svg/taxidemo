@@ -16,7 +16,7 @@ This is a demo / proof-of-concept. There is no database — all state lives in m
 
 ## Current Status
 
-**Version:** 0.1.0
+**Version:** 0.2.0
 **Server:** `http://localhost:8080`
 **Branch:** `master`
 **Remote:** `https://github.com/andythorn1969-svg/taxidemo`
@@ -69,27 +69,27 @@ taxidemo/
 
 ---
 
-## UI Layout (Step 11)
+## UI Layout (Step 11 — current)
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  TOPBAR: Title | Zone ▾ | Passenger [       ] [Dispatch] │
-├──────────────┬──────────────────────────────────────────┤
-│ LEFT (35%)   │  RIGHT (65%)                             │
-│ Zone Trap    │  ┌──────────────────────────────────┐    │
-│ Queues       │  │  LIVE MAP (flex:1, min 500px)    │    │
-│ (scrollable) │  │  - Green/red plate badges        │    │
-│              │  │  - Blue pickup markers            │    │
-│ Z01 Progress │  │  - Purple destination markers    │    │
-│  T1 Alice    │  │  - Dashed journey lines          │    │
-│  T2 Bob      │  │  - Zone boundary polygons        │    │
-│ Z02 Thanet   │  └──────────────────────────────────┘    │
-│  T1 Carol    │  Dispatch Log (max 180px, scrollable)    │
-│ ...          │  Jobs List (filter: all/active/done)     │
-│              │  [+ NEW BOOKING] opens pre-book modal    │
-└──────────────┴──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  TOPBAR: Title | Zone ▾ | Passenger [            ] [Dispatch] │
+├──────────────┬───────────────────────────────────────────────┤
+│ LEFT (35%)   │  RIGHT (65%)                                  │
+│ Zone Trap    │  ┌─────────────────────────────────────────┐  │
+│ Queues       │  │  LIVE MAP (flex:1, min 500px)           │  │
+│ (scrollable) │  │  - Green/red plate badges               │  │
+│              │  │  - Blue pickup markers                  │  │
+│ Z01 Progress │  │  - Purple destination markers           │  │
+│  T1 Alice    │  │  - Dashed journey lines                 │  │
+│  T2 Bob      │  │  - Zone boundary polygons               │  │
+│ Z02 Thanet   │  └─────────────────────────────────────────┘  │
+│  T1 Carol    │  Dispatch Log (max 180px, scrollable)         │
+│ ...          │  [+ NEW BOOKING] button                       │
+│              │  Jobs List (filter: all/active/done)          │
+└──────────────┴───────────────────────────────────────────────┘
 
-Pre-book modal (overlay):
+New Booking modal (overlay):
   Customer name, phone, notes, account flag
   Pickup address → geocode → draggable pin on mini-map
   Destination address → geocode → draggable pin
@@ -143,7 +143,23 @@ The entire HTML page is a single Go `text/template` const (`indexHTML`) embedded
 - [ ] Persist state to a file or SQLite so it survives restarts
 - [ ] Add websocket or SSE so the UI updates without a page refresh
 - [ ] Add a legend to the map (green=available, red=busy, blue=pickup, purple=destination)
-- [ ] Wire up `AverageApproachMinutes` per zone in `SeedData` (currently all default to 10)
+
+---
+
+## Session 3 To-Do
+
+Priority order for next session:
+
+1. **Three-column layout redesign** — equal thirds: booking form left, live map centre, trap queues right. Jobs list full width below all three columns.
+2. **Left panel as single action panel** — all booking creation and editing happens in the left column. No separate modal. The panel is always visible.
+3. **Edit mode via jobs list** — clicking a row in the jobs list populates the left panel in edit mode (pre-filled fields, submit updates rather than creates).
+4. **Zone names showing as IDs** — zone column in jobs list displays raw IDs (e.g. `Z18`) instead of readable names (e.g. `Town`). Needs the same `zoneName` lookup used in the template.
+5. **Driver name missing on dispatched jobs** — jobs table shows no driver name after dispatch. Driver reference on `Job.Driver` needs surfacing in the JSON/render path.
+6. **Destination zone column empty** — destination zone not being set or returned for jobs. Investigate whether `DestZone` field is missing from `Booking` or just not populated.
+7. **General cosmetic tweaks** — tighten spacing, consistent font sizes, readable colour contrast throughout.
+
+### Future milestone
+- **OSRM live routing** — replace the fixed `AverageApproachMinutes` zone lookup with a real road-distance call to an OSRM instance. Approach time would be calculated from driver GPS position to pickup GPS position at dispatch time.
 
 ---
 
