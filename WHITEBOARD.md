@@ -32,6 +32,7 @@ This is a demo / proof-of-concept. There is no database — all state lives in m
 | 8 | Zone boundary polygons on live map |
 | 9 | Destination markers (purple) and dashed journey lines per booking |
 | 10 | Landscape layout redesign — two-column dispatch console, plate number badges on driver markers |
+| 11 | Pre-book system — modal, Nominatim geocoding, jobs list panel, prebook scheduler, zone matching |
 
 ---
 
@@ -39,13 +40,14 @@ This is a demo / proof-of-concept. There is no database — all state lives in m
 
 ```
 taxidemo/
-├── main.go                  Entry point only (~25 lines)
+├── main.go                  Entry point only (~32 lines)
 ├── models/
-│   └── models.go            Structs, constants, SeedData()
+│   └── models.go            Structs, constants, SeedData(), AppState with RWMutex
 ├── dispatch/
-│   └── dispatch.go          FindZone, FindNearestDriver, DispatchJob, destinations list
+│   └── dispatch.go          FindZone, FindNearestDriver, NearestZone, DispatchJob,
+│                            CompleteBooking, CancelBooking, StartScheduler
 ├── api/
-│   └── handlers.go          AppState, HTML template, HTTP handlers
+│   └── handlers.go          Handler struct, RegisterRoutes, HTML template, HTTP handlers
 ├── go.mod
 ├── .gitignore
 └── WHITEBOARD.md
@@ -55,14 +57,19 @@ taxidemo/
 | Method | Path | Handler | Purpose |
 |--------|------|---------|---------|
 | GET | `/` | HandleIndex | Main dispatch console |
-| POST | `/dispatch` | HandleDispatch | Create and dispatch a booking |
+| POST | `/dispatch` | HandleDispatch | Legacy form-based booking (immediate only) |
 | GET | `/api/drivers` | HandleDriverData | JSON feed for map driver markers (incl. plate number) |
 | GET | `/api/bookings` | HandleBookingData | JSON feed for map booking/destination markers |
 | GET | `/api/zones` | HandleZoneData | JSON feed for zone polygons and driver counts |
+| GET | `/api/geocode` | HandleGeocode | Nominatim proxy — returns `{lat, lng}` for an address |
+| POST | `/api/booking/new` | HandleNewBooking | Create immediate or pre-booked job from JSON |
+| POST | `/api/booking/complete` | HandleCompleteBooking | Mark a booking completed, free driver |
+| POST | `/api/booking/cancel` | HandleCancelBooking | Cancel a booking, free driver if assigned |
+| GET | `/api/prebooks` | HandlePrebookData | JSON list of prebooks (filter: active/completed/all) |
 
 ---
 
-## UI Layout (Step 10)
+## UI Layout (Step 11)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -78,8 +85,16 @@ taxidemo/
 │  T2 Bob      │  │  - Zone boundary polygons        │    │
 │ Z02 Thanet   │  └──────────────────────────────────┘    │
 │  T1 Carol    │  Dispatch Log (max 180px, scrollable)    │
-│ ...          │                                          │
+│ ...          │  Jobs List (filter: all/active/done)     │
+│              │  [+ NEW BOOKING] opens pre-book modal    │
 └──────────────┴──────────────────────────────────────────┘
+
+Pre-book modal (overlay):
+  Customer name, phone, notes, account flag
+  Pickup address → geocode → draggable pin on mini-map
+  Destination address → geocode → draggable pin
+  Booking type (immediate / pre-book) + requested time
+  [Submit] → POST /api/booking/new
 ```
 
 ---
@@ -96,7 +111,16 @@ A driver accepts a job if they have waited ≥ 30 minutes, otherwise they declin
 If a zone has no available drivers, `FindNearestDriver` scans all zones and returns the first available driver it finds. No geo-distance calculation yet — just linear scan.
 
 ### In-memory state
-`api.AppState` holds zones, drivers and jobs. No persistence — restarts wipe the state. Intentional for demo purposes.
+`models.AppState` holds zones, drivers, bookings and jobs behind a `sync.RWMutex`. No persistence — restarts wipe the state. Intentional for demo purposes.
+
+### Zone matching from coordinates
+`dispatch.NearestZone(lat, lng)` finds the closest zone centre from the `zoneCoords` map using squared Euclidean distance. Called in `HandleNewBooking` whenever geocoded coordinates are present — client-supplied zone ID is ignored when coordinates are available.
+
+### Geocoding
+`HandleGeocode` proxies Nominatim (OpenStreetMap). Automatically appends "Southend-on-Sea, Essex" context if the query doesn't already mention Southend or Essex.
+
+### Prebook scheduler
+`dispatch.StartScheduler` runs a 60-second ticker goroutine. Each tick calls `runSchedulerCycle`, which finds all pending prebooks whose `RequestedTime - AverageApproachMinutes` has passed and dispatches them via `DispatchJob`.
 
 ### Booking coordinates
 Bookings are plotted near their pickup zone centre with a ±0.003° random offset so multiple bookings in the same zone don't stack on the map.
@@ -108,7 +132,7 @@ Bookings are plotted near their pickup zone centre with a ±0.003° random offse
 Each driver is assigned a random plate number (1–500) at startup via `SeedData()`. Plate numbers are shown as badge labels directly on the map markers — no click needed.
 
 ### Template rendering
-The entire HTML page is a single Go `text/template` embedded in `handlers.go`. No external template files, no external CSS — keeps the project self-contained.
+The entire HTML page is a single Go `text/template` const (`indexHTML`) embedded in `handlers.go`. Template is built once in `RegisterRoutes` with FuncMap closures over `h.State`. No external template files, no external CSS — keeps the project self-contained.
 
 ---
 
@@ -116,10 +140,10 @@ The entire HTML page is a single Go `text/template` embedded in `handlers.go`. N
 
 - [ ] Improve `FindNearestDriver` to use actual Haversine geo-distance
 - [ ] Add driver "return to zone" logic after completing a job
-- [ ] Add a way to mark jobs as completed from the UI
 - [ ] Persist state to a file or SQLite so it survives restarts
 - [ ] Add websocket or SSE so the UI updates without a page refresh
 - [ ] Add a legend to the map (green=available, red=busy, blue=pickup, purple=destination)
+- [ ] Wire up `AverageApproachMinutes` per zone in `SeedData` (currently all default to 10)
 
 ---
 
