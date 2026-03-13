@@ -124,22 +124,27 @@ type Job struct {
 
 // Customer represents a known passenger, potentially an account holder.
 type Customer struct {
-	ID                    string
-	Name                  string
-	Phone                 string
-	Address               string
-	Notes                 string
-	FavouriteDestinations []string
-	IsAccount             bool
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	Phone                 string   `json:"phone"`
+	Address               string   `json:"address"`
+	Notes                 string   `json:"notes"`
+	FavouriteDestinations []string `json:"favourite_destinations"`
+	IsAccount             bool     `json:"is_account"`
+	NoShowCount       int  `json:"no_show_count"`
+	CancellationCount int  `json:"cancellation_count"`
+	Flagged           bool `json:"flagged"`
+	Blocked           bool `json:"blocked"`
 }
 
 // AppState holds all runtime state for the dispatch system.
 type AppState struct {
-	Mu       sync.RWMutex
-	Drivers  []*Driver
-	Zones    []*Zone
-	Bookings []*Booking
-	Jobs     []*Job
+	Mu        sync.RWMutex
+	Drivers   []*Driver
+	Zones     []*Zone
+	Bookings  []*Booking
+	Jobs      []*Job
+	Customers []*Customer
 }
 
 // SeedData creates the initial zones and drivers for the demo.

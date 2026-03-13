@@ -73,6 +73,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/booking/cancel", h.HandleCancelBooking)
 	mux.HandleFunc("/api/booking/update", h.HandleUpdateBooking)
 	mux.HandleFunc("/api/prebooks", h.HandlePrebookData)
+	mux.HandleFunc("/api/customer/lookup", h.HandleCustomerLookup)
+	mux.HandleFunc("/api/customers", h.HandleCustomerList)
+	mux.HandleFunc("/api/customer/new", h.HandleNewCustomer)
+	mux.HandleFunc("/api/customer/update", h.HandleUpdateCustomer)
 }
 
 // HandleIndex renders the main dispatch UI.
@@ -422,12 +426,78 @@ func (h *Handler) HandleCancelBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
+
+	// Peek at driver status and booking phone BEFORE cancelling.
+	// CancelBooking resets the driver to StatusAvailable, so we must capture
+	// the driver's current status now to distinguish:
+	//   StatusOnJob (arrived at pickup) → no-show (driver got there, nobody present)
+	//   StatusDispatched (en route)     → cancellation (passenger cancelled early)
+	type cancelSnapshot struct {
+		phone        string
+		bookingTime  time.Time
+		driverStatus models.DriverStatus
+	}
+	var snap cancelSnapshot
+	h.State.Mu.RLock()
+	for _, b := range h.State.Bookings {
+		if b.ID == id {
+			snap.phone = b.Phone
+			snap.bookingTime = b.RequestedTime
+			if snap.bookingTime.IsZero() {
+				snap.bookingTime = b.CreatedAt
+			}
+			break
+		}
+	}
+	if snap.phone != "" {
+		for _, j := range h.State.Jobs {
+			if j.Booking.ID == id && j.Driver != nil {
+				for _, d := range h.State.Drivers {
+					if d.ID == j.Driver.ID {
+						snap.driverStatus = d.Status
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+	h.State.Mu.RUnlock()
+
 	if err := dispatch.CancelBooking(id, h.State); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprintf(w, `{"error":%q}`, err.Error())
 		return
 	}
+
+	// Update customer counts only when a driver was assigned (status set).
+	if snap.phone != "" && snap.driverStatus != "" {
+		h.State.Mu.Lock()
+		var cust *models.Customer
+		for _, c := range h.State.Customers {
+			if normalisePhone(c.Phone) == normalisePhone(snap.phone) {
+				cust = c
+				break
+			}
+		}
+		if cust != nil {
+			if snap.driverStatus == models.StatusOnJob {
+				// Driver arrived at pickup — nobody there: no-show.
+				// Apply late-night exclusion.
+				if !dispatch.IsLateWeekendBooking(snap.bookingTime) {
+					cust.NoShowCount++
+				}
+			} else {
+				// Driver en route but not yet arrived: cancellation.
+				// Late-night exclusion does NOT apply to cancellations.
+				cust.CancellationCount++
+			}
+			cust.Flagged = dispatch.ShouldFlagCustomer(cust.Phone, h.State.Customers, h.State.Bookings)
+		}
+		h.State.Mu.Unlock()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"ok":true}`)
 }
@@ -634,6 +704,273 @@ func (h *Handler) HandlePrebookData(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
+// normalisePhone strips spaces and dashes for flexible phone matching.
+func normalisePhone(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, "-", "")
+	return s
+}
+
+// HandleCustomerLookup — GET /api/customer/lookup?phone=...
+// Returns the customer plus previous_pickups and previous_destinations derived
+// from their booking history, ordered most-recent first and deduped.
+func (h *Handler) HandleCustomerLookup(w http.ResponseWriter, r *http.Request) {
+	phone := normalisePhone(r.URL.Query().Get("phone"))
+	if phone == "" {
+		http.Error(w, `{"error":"phone param required"}`, http.StatusBadRequest)
+		return
+	}
+	h.State.Mu.RLock()
+	var found *models.Customer
+	for _, c := range h.State.Customers {
+		if normalisePhone(c.Phone) == phone {
+			found = c
+			break
+		}
+	}
+	var prevPickups, prevDests []string
+	if found != nil {
+		seenPickup := make(map[string]bool)
+		seenDest := make(map[string]bool)
+		// Iterate in reverse so most-recent booking appears first.
+		for i := len(h.State.Bookings) - 1; i >= 0; i-- {
+			b := h.State.Bookings[i]
+			if normalisePhone(b.Phone) != normalisePhone(found.Phone) {
+				continue
+			}
+			if b.PickupAddress != "" && !seenPickup[b.PickupAddress] {
+				seenPickup[b.PickupAddress] = true
+				prevPickups = append(prevPickups, b.PickupAddress)
+			}
+			dest := b.DestAddress
+			if dest == "" {
+				dest = b.Destination
+			}
+			if dest != "" && !seenDest[dest] {
+				seenDest[dest] = true
+				prevDests = append(prevDests, dest)
+			}
+		}
+	}
+	h.State.Mu.RUnlock()
+	if found == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"not found"}`))
+		return
+	}
+	if prevPickups == nil {
+		prevPickups = []string{}
+	}
+	if prevDests == nil {
+		prevDests = []string{}
+	}
+	resp := struct {
+		*models.Customer
+		PreviousPickups      []string `json:"previous_pickups"`
+		PreviousDestinations []string `json:"previous_destinations"`
+	}{
+		Customer:             found,
+		PreviousPickups:      prevPickups,
+		PreviousDestinations: prevDests,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// customerJSON is the wire format for customer list responses.
+type customerJSON struct {
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	Phone                 string   `json:"phone"`
+	Address               string   `json:"address"`
+	Notes                 string   `json:"notes"`
+	IsAccount             bool     `json:"is_account"`
+	FavouriteDestinations []string `json:"favourite_destinations"`
+	BookingCount          int      `json:"booking_count"`
+	NoShowCount       int  `json:"no_show_count"`
+	CancellationCount int  `json:"cancellation_count"`
+	Flagged           bool `json:"flagged"`
+	Blocked           bool `json:"blocked"`
+}
+
+// HandleCustomerList — GET /api/customers?search=...
+// Returns all customers (optionally filtered), with booking_count per customer.
+func (h *Handler) HandleCustomerList(w http.ResponseWriter, r *http.Request) {
+	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
+
+	h.State.Mu.RLock()
+	customers := make([]*models.Customer, len(h.State.Customers))
+	copy(customers, h.State.Customers)
+	bookings := make([]*models.Booking, len(h.State.Bookings))
+	copy(bookings, h.State.Bookings)
+	h.State.Mu.RUnlock()
+
+	// Build booking count map keyed by normalised phone.
+	bookingCount := make(map[string]int, len(bookings))
+	for _, b := range bookings {
+		k := normalisePhone(b.Phone)
+		if k != "" {
+			bookingCount[k]++
+		}
+	}
+
+	result := make([]customerJSON, 0, len(customers))
+	for _, c := range customers {
+		if search != "" {
+			nameLower := strings.ToLower(c.Name)
+			phoneLower := strings.ToLower(c.Phone)
+			if !strings.Contains(nameLower, search) && !strings.Contains(phoneLower, search) {
+				continue
+			}
+		}
+		favs := c.FavouriteDestinations
+		if favs == nil {
+			favs = []string{}
+		}
+		result = append(result, customerJSON{
+			ID:                    c.ID,
+			Name:                  c.Name,
+			Phone:                 c.Phone,
+			Address:               c.Address,
+			Notes:                 c.Notes,
+			IsAccount:             c.IsAccount,
+			FavouriteDestinations: favs,
+			BookingCount:          bookingCount[normalisePhone(c.Phone)],
+			NoShowCount:           c.NoShowCount,
+			CancellationCount:     c.CancellationCount,
+			Flagged:               c.Flagged,
+			Blocked:               c.Blocked,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// HandleNewCustomer — POST /api/customer/new
+// Creates a new customer record. Returns 409 if phone already registered.
+func (h *Handler) HandleNewCustomer(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Name                  string   `json:"name"`
+		Phone                 string   `json:"phone"`
+		Address               string   `json:"address"`
+		Notes                 string   `json:"notes"`
+		IsAccount             bool     `json:"is_account"`
+		FavouriteDestinations []string `json:"favourite_destinations"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+	req.Phone = strings.TrimSpace(req.Phone)
+	if req.Phone == "" {
+		http.Error(w, `{"error":"phone is required"}`, http.StatusBadRequest)
+		return
+	}
+	normNew := normalisePhone(req.Phone)
+
+	h.State.Mu.Lock()
+	for _, c := range h.State.Customers {
+		if normalisePhone(c.Phone) == normNew {
+			h.State.Mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte(`{"error":"phone already registered"}`))
+			return
+		}
+	}
+	favs := req.FavouriteDestinations
+	if favs == nil {
+		favs = []string{}
+	}
+	c := &models.Customer{
+		ID:                    dispatch.GenerateID("CU"),
+		Name:                  req.Name,
+		Phone:                 req.Phone,
+		Address:               req.Address,
+		Notes:                 req.Notes,
+		IsAccount:             req.IsAccount,
+		FavouriteDestinations: favs,
+	}
+	h.State.Customers = append(h.State.Customers, c)
+	h.State.Mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(c)
+}
+
+// HandleUpdateCustomer — POST /api/customer/update
+// Updates mutable fields on an existing customer by ID. Returns 404 if not found.
+func (h *Handler) HandleUpdateCustomer(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		ID                    string   `json:"id"`
+		Name                  string   `json:"name"`
+		Phone                 string   `json:"phone"`
+		Address               string   `json:"address"`
+		Notes                 string   `json:"notes"`
+		IsAccount             bool     `json:"is_account"`
+		FavouriteDestinations []string `json:"favourite_destinations"`
+		NoShowCount       int  `json:"no_show_count"`
+		CancellationCount int  `json:"cancellation_count"`
+		Blocked           bool `json:"blocked"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		http.Error(w, `{"error":"id is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.State.Mu.Lock()
+	var found *models.Customer
+	for _, c := range h.State.Customers {
+		if c.ID == req.ID {
+			found = c
+			break
+		}
+	}
+	if found == nil {
+		h.State.Mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"not found"}`))
+		return
+	}
+	favs := req.FavouriteDestinations
+	if favs == nil {
+		favs = []string{}
+	}
+	found.Name = req.Name
+	found.Phone = req.Phone
+	found.Address = req.Address
+	found.Notes = req.Notes
+	found.IsAccount = req.IsAccount
+	found.FavouriteDestinations = favs
+	found.NoShowCount = req.NoShowCount
+	found.CancellationCount = req.CancellationCount
+	found.Blocked = req.Blocked
+	found.Flagged = dispatch.ShouldFlagCustomer(found.Phone, h.State.Customers, h.State.Bookings)
+	h.State.Mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(found)
+}
+
 // indexHTML is the complete single-page dispatch UI template.
 const indexHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -698,6 +1035,7 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
 
 <div class="topbar">
   <h1>Southend Taxi Cooperative &mdash; Dispatch</h1>
+  <button onclick="openCustomerPanel()" style="margin-left:auto;padding:10px 22px;background:#7c3aed;border:none;color:#fff;border-radius:5px;font-size:.92rem;font-family:'Segoe UI',sans-serif;font-weight:600;cursor:pointer;letter-spacing:.5px;">&#128101; CUSTOMERS</button>
 </div>
 
 <div class="main">
@@ -721,7 +1059,8 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
       </div>
       <div class="form-row">
         <label class="form-label">Phone</label>
-        <input id="bkPhone" type="tel" class="form-input" placeholder="e.g. 01702 123456" />
+        <input id="bkPhone" type="tel" class="form-input" placeholder="e.g. 01702 123456" onblur="lookupCustomer()" />
+        <div id="customerStatus" style="font-size:.66rem;margin-top:3px;min-height:14px;"></div>
       </div>
       <div class="form-row">
         <label class="form-label">Pickup address</label>
@@ -730,6 +1069,7 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
           <span id="bkPickupStatus" class="geocode-status"></span>
         </div>
         <div id="bkPickupZoneTag" class="geocode-hint"></div>
+        <div id="pickupSuggestions" style="margin-top:4px;display:none;flex-wrap:wrap;gap:4px;"></div>
       </div>
       <div class="form-row">
         <label class="form-label">Destination address</label>
@@ -738,6 +1078,7 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
           <span id="bkDestStatus" class="geocode-status"></span>
         </div>
         <div id="bkDestZoneTag" class="geocode-hint"></div>
+        <div id="destSuggestions" style="margin-top:4px;display:none;flex-wrap:wrap;gap:4px;"></div>
       </div>
       <div class="form-row">
         <label class="form-label">Notes</label>
@@ -748,6 +1089,79 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
         <label for="bkIsAccount" style="font-size:.8rem;color:#90caf9;cursor:pointer;">Account customer</label>
       </div>
       <button class="confirm-btn" onclick="submitBooking()">&#10003; Confirm Booking</button>
+    </div>
+
+    <!-- CUSTOMERS: overlay panel — same width as left-col, hidden by default -->
+    <div id="customerPanel" style="display:none;width:22%;flex-shrink:0;height:100%;overflow-y:auto;background:#0d0d1a;border-right:1px solid #1e2a3a;padding:10px 12px;flex-direction:column;">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+        <h2 class="panel-heading" style="margin-bottom:0;flex:1;">Customers</h2>
+        <button onclick="newCustomer()" style="padding:4px 10px;background:#0d2233;border:1px solid #4fc3f7;color:#4fc3f7;border-radius:3px;font-size:.72rem;font-family:'Segoe UI',sans-serif;cursor:pointer;">+ New</button>
+        <button onclick="closeCustomerPanel()" style="padding:4px 10px;background:transparent;border:1px solid #546e7a;color:#546e7a;border-radius:3px;font-size:.72rem;font-family:'Segoe UI',sans-serif;cursor:pointer;">&#10005; Close</button>
+      </div>
+      <input id="customerSearch" type="text" class="form-input" placeholder="Search name or phone&hellip;" onkeyup="loadCustomers(this.value)" style="margin-bottom:8px;" />
+      <div style="overflow-y:auto;flex:1;margin-bottom:8px;">
+        <table id="customerTable" style="width:100%;border-collapse:collapse;font-family:monospace;font-size:11px;">
+          <thead>
+            <tr style="color:#546e7a;text-align:left;">
+              <th style="padding:5px 6px;border-bottom:1px solid #1e2a3a;">NAME</th>
+              <th style="padding:5px 6px;border-bottom:1px solid #1e2a3a;">PHONE</th>
+              <th style="padding:5px 6px;border-bottom:1px solid #1e2a3a;">ACC</th>
+              <th style="padding:5px 6px;border-bottom:1px solid #1e2a3a;">BKGS</th>
+            </tr>
+          </thead>
+          <tbody id="customerTableBody">
+            <tr><td colspan="4" style="padding:14px;text-align:center;color:#37474f;font-family:monospace;">No customers</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <!-- Edit / create form — hidden until a row is clicked or New is pressed -->
+      <div id="customerEditForm" style="display:none;border-top:1px solid #1e2a3a;padding-top:10px;">
+        <h3 id="customerEditTitle" style="color:#90caf9;font-size:.72rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Edit Customer</h3>
+        <input type="hidden" id="ceId" />
+        <div class="form-row">
+          <label class="form-label">Name</label>
+          <input id="ceName" type="text" class="form-input" placeholder="Full name" />
+        </div>
+        <div class="form-row">
+          <label class="form-label">Phone</label>
+          <input id="cePhone" type="tel" class="form-input" placeholder="e.g. 01702 123456" />
+        </div>
+        <div class="form-row">
+          <label class="form-label">Address</label>
+          <input id="ceAddress" type="text" class="form-input" placeholder="Home address" />
+        </div>
+        <div class="form-row">
+          <label class="form-label">Notes</label>
+          <textarea id="ceNotes" rows="2" class="form-input" placeholder="Any relevant notes" style="resize:vertical;"></textarea>
+        </div>
+        <div class="form-row">
+          <label class="form-label">Favourite destinations (comma-separated)</label>
+          <input id="ceFavDests" type="text" class="form-input" placeholder="e.g. Southend Airport, Victoria Station" />
+        </div>
+        <div class="form-row" style="display:flex;align-items:center;gap:8px;">
+          <input id="ceIsAccount" type="checkbox" style="width:15px;height:15px;" />
+          <label for="ceIsAccount" style="font-size:.8rem;color:#90caf9;cursor:pointer;">Account customer</label>
+        </div>
+        <div class="form-row" style="display:flex;align-items:center;gap:8px;">
+          <input id="ceBlocked" type="checkbox" style="width:15px;height:15px;" />
+          <label for="ceBlocked" style="font-size:.8rem;color:#ef4444;cursor:pointer;">Blocked</label>
+        </div>
+        <div class="form-row" style="display:flex;align-items:center;gap:8px;justify-content:space-between;">
+          <span style="font-size:.8rem;color:#78909c;">No-shows: <span id="ceNoShowDisplay" style="color:#e0e0e0;font-weight:600;">0</span></span>
+          <button onclick="resetNoShowCount()" style="padding:3px 10px;background:transparent;border:1px solid #546e7a;color:#546e7a;border-radius:3px;font-size:.72rem;cursor:pointer;font-family:'Segoe UI',sans-serif;">Reset</button>
+          <input type="hidden" id="ceNoShowCount" value="0" />
+        </div>
+        <div class="form-row" style="display:flex;align-items:center;gap:8px;justify-content:space-between;">
+          <span style="font-size:.8rem;color:#78909c;">Cancellations: <span id="ceCancellationDisplay" style="color:#e0e0e0;font-weight:600;">0</span></span>
+          <button onclick="resetCancellationCount()" style="padding:3px 10px;background:transparent;border:1px solid #546e7a;color:#546e7a;border-radius:3px;font-size:.72rem;cursor:pointer;font-family:'Segoe UI',sans-serif;">Reset</button>
+          <input type="hidden" id="ceCancellationCount" value="0" />
+        </div>
+        <div id="ceFlaggedIndicator" style="display:none;padding:5px 8px;background:#3a2a00;border:1px solid #f59e0b;border-radius:4px;color:#f59e0b;font-size:.75rem;margin-bottom:4px;">&#9888; Flagged — no-show rate exceeds policy threshold</div>
+        <div style="display:flex;gap:6px;margin-top:6px;">
+          <button onclick="saveCustomer()" style="flex:1;padding:8px;background:#1565c0;color:#fff;border:none;border-radius:4px;font-size:.82rem;cursor:pointer;font-family:'Segoe UI',sans-serif;font-weight:600;">Save</button>
+          <button onclick="cancelCustomerEdit()" style="padding:8px 14px;background:transparent;border:1px solid #546e7a;color:#546e7a;border-radius:4px;font-size:.82rem;cursor:pointer;font-family:'Segoe UI',sans-serif;">Cancel</button>
+        </div>
+      </div>
     </div>
 
     <!-- CENTRE: map + bookings panel -->
@@ -974,6 +1388,7 @@ let jobFilter = 'active';
 let editingBookingId = null;
 let currentBookings = [];
 let selectedRow = null;
+let foundCustomer = null; // null=no lookup, 'new'=new customer, object=existing customer
 
 // ─── Modal open/close ───────────────────────────────────────────────────────
 function openPrebookModal() {
@@ -1009,11 +1424,102 @@ function resetBookingForm() {
   document.getElementById('bkDestStatus').textContent = '';
   document.getElementById('bkPickupZoneTag').textContent = '';
   document.getElementById('bkDestZoneTag').textContent = '';
+  document.getElementById('customerStatus').textContent = '';
+  clearPickupSuggestions();
+  clearDestSuggestions();
+  foundCustomer = null;
   pickupCoords = null;
   destCoords = null;
   if (pickupMarker) { map.removeLayer(pickupMarker); pickupMarker = null; }
   if (destMarker)   { map.removeLayer(destMarker);   destMarker = null; }
   setBookingMode('immediate');
+}
+
+// ─── Customer lookup ─────────────────────────────────────────────────────────
+async function lookupCustomer() {
+  const phone = document.getElementById('bkPhone').value.trim();
+  const statusEl = document.getElementById('customerStatus');
+  if (!phone) { statusEl.textContent = ''; foundCustomer = null; clearPickupSuggestions(); clearDestSuggestions(); return; }
+  try {
+    const resp = await fetch('/api/customer/lookup?phone=' + encodeURIComponent(phone));
+    if (resp.ok) {
+      const c = await resp.json();
+      foundCustomer = c;
+      document.getElementById('bkCustomerName').value = c.name  || '';
+      document.getElementById('bkNotes').value         = c.notes || '';
+      document.getElementById('bkIsAccount').checked   = !!c.is_account;
+      if (c.blocked) {
+        statusEl.innerHTML = '<span style="color:#ef4444;">&#128683; Blocked customer</span>';
+      } else if (c.flagged) {
+        statusEl.innerHTML = '<span style="color:#f59e0b;">&#9888; ' + (c.no_show_count||0) + ' no-shows — review recommended</span>';
+      } else {
+        statusEl.innerHTML = '<span style="color:#81c784;">&#10003; Customer found: ' + (c.name || phone) + '</span>';
+      }
+      // Merge favourite_destinations with previous_destinations, dedup preserving order.
+      const destSeen = new Set();
+      const destSuggs = [...(c.favourite_destinations||[]), ...(c.previous_destinations||[])].filter(f => {
+        if (destSeen.has(f)) return false; destSeen.add(f); return true;
+      });
+      showDestSuggestions(destSuggs);
+      showPickupSuggestions(c.previous_pickups || []);
+    } else if (resp.status === 404) {
+      foundCustomer = 'new';
+      statusEl.innerHTML = '<span style="color:#78909c;">New customer — record will be created on booking</span>';
+      clearPickupSuggestions();
+      clearDestSuggestions();
+    } else {
+      foundCustomer = null;
+      statusEl.textContent = '';
+      clearPickupSuggestions();
+      clearDestSuggestions();
+    }
+  } catch(e) {
+    foundCustomer = null;
+    statusEl.textContent = '';
+    clearPickupSuggestions();
+    clearDestSuggestions();
+    console.error('Customer lookup error:', e);
+  }
+}
+
+function showDestSuggestions(favs) {
+  const el = document.getElementById('destSuggestions');
+  if (!favs || favs.length === 0) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'flex';
+  el.innerHTML = favs.map(f =>
+    '<span onclick="useFavDest(\'' + f.replace(/\\/g,'\\\\').replace(/'/g,"\\'") + '\')" style="cursor:pointer;padding:2px 8px;background:#0d1220;border:1px solid #2a3a4a;color:#90caf9;border-radius:10px;font-size:.66rem;white-space:nowrap;">' + f + '</span>'
+  ).join('');
+}
+
+function clearDestSuggestions() {
+  const el = document.getElementById('destSuggestions');
+  el.style.display = 'none';
+  el.innerHTML = '';
+}
+
+function useFavDest(addr) {
+  document.getElementById('bkDestAddress').value = addr;
+  geocodeAddress('dest');
+}
+
+function showPickupSuggestions(suggs) {
+  const el = document.getElementById('pickupSuggestions');
+  if (!suggs || suggs.length === 0) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'flex';
+  el.innerHTML = suggs.map(f =>
+    '<span onclick="usePickupSugg(\'' + f.replace(/\\/g,'\\\\').replace(/'/g,"\\'") + '\')" style="cursor:pointer;padding:2px 8px;background:#0d1220;border:1px solid #2a3a4a;color:#90caf9;border-radius:10px;font-size:.66rem;white-space:nowrap;">' + f + '</span>'
+  ).join('');
+}
+
+function clearPickupSuggestions() {
+  const el = document.getElementById('pickupSuggestions');
+  el.style.display = 'none';
+  el.innerHTML = '';
+}
+
+function usePickupSugg(addr) {
+  document.getElementById('bkPickupAddress').value = addr;
+  geocodeAddress('pickup');
 }
 
 // ─── Geocoding ──────────────────────────────────────────────────────────────
@@ -1174,6 +1680,19 @@ async function updateBooking(id) {
     });
     const result = await resp.json();
     if (result.error) { alert('Update error: ' + result.error); return; }
+    if (foundCustomer === 'new') {
+      fetch('/api/customer/new', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          name:                  body.customer_name,
+          phone:                 body.phone,
+          notes:                 body.notes,
+          is_account:            body.is_account,
+          favourite_destinations: []
+        })
+      }).catch(() => {});
+    }
     exitEditMode();
     loadJobs();
   } catch(e) {
@@ -1213,6 +1732,19 @@ async function submitBooking() {
     });
     const booking = await resp.json();
     if (booking.error) { alert('Booking error: ' + booking.error); return; }
+    if (foundCustomer === 'new') {
+      fetch('/api/customer/new', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          name:                  body.customer_name,
+          phone:                 body.phone,
+          notes:                 body.notes,
+          is_account:            body.is_account,
+          favourite_destinations: []
+        })
+      }).catch(() => {});
+    }
     closePrebookModal();
     loadJobs();
   } catch(e) {
@@ -1291,6 +1823,139 @@ async function cancelJob(id) {
 // Initial load + poll every 30 seconds
 loadJobs();
 setInterval(loadJobs, 30000);
+
+// ─── Customer panel ──────────────────────────────────────────────────────────
+let customersCache = [];
+let currentEditCustomer = null;
+
+function openCustomerPanel() {
+  document.querySelector('.left-col').style.display = 'none';
+  const panel = document.getElementById('customerPanel');
+  panel.style.display = 'flex';
+  document.getElementById('customerSearch').value = '';
+  document.getElementById('customerEditForm').style.display = 'none';
+  loadCustomers('');
+}
+
+function closeCustomerPanel() {
+  document.getElementById('customerPanel').style.display = 'none';
+  document.querySelector('.left-col').style.display = '';
+}
+
+async function loadCustomers(search) {
+  try {
+    const resp = await fetch('/api/customers?search=' + encodeURIComponent(search || ''));
+    const customers = await resp.json();
+    renderCustomerTable(customers || []);
+  } catch(e) { console.error('Failed to load customers:', e); }
+}
+
+function renderCustomerTable(customers) {
+  customersCache = customers;
+  const tbody = document.getElementById('customerTableBody');
+  if (!customers || customers.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="padding:14px;text-align:center;color:#37474f;font-family:monospace;">No customers found</td></tr>';
+    return;
+  }
+  tbody.innerHTML = customers.map((c, i) =>
+    '<tr onclick="editCustomer(' + i + ')" style="cursor:pointer;border-bottom:1px solid #1a1a2e;">' +
+    '<td style="padding:5px 6px;color:#e0e0e0;">' + (c.name||'—') + '</td>' +
+    '<td style="padding:5px 6px;color:#90caf9;font-size:10px;">' + (c.phone||'—') + '</td>' +
+    '<td style="padding:5px 6px;">' + (c.is_account ? '<span style="color:#a78bfa;font-size:10px;">ACC</span>' : '') + '</td>' +
+    '<td style="padding:5px 6px;color:#546e7a;">' + (c.booking_count||0) + '</td>' +
+    '</tr>'
+  ).join('');
+}
+
+function editCustomer(idx) {
+  const c = customersCache[idx];
+  currentEditCustomer = c;
+  document.getElementById('customerEditTitle').textContent = 'Edit Customer';
+  document.getElementById('ceId').value          = c.id || '';
+  document.getElementById('ceName').value        = c.name || '';
+  document.getElementById('cePhone').value       = c.phone || '';
+  document.getElementById('ceAddress').value     = c.address || '';
+  document.getElementById('ceNotes').value       = c.notes || '';
+  document.getElementById('ceIsAccount').checked = !!c.is_account;
+  document.getElementById('ceBlocked').checked   = !!c.blocked;
+  document.getElementById('ceFavDests').value    = (c.favourite_destinations||[]).join(', ');
+  const ns = c.no_show_count || 0;
+  document.getElementById('ceNoShowCount').value         = ns;
+  document.getElementById('ceNoShowDisplay').textContent = ns;
+  const ca = c.cancellation_count || 0;
+  document.getElementById('ceCancellationCount').value         = ca;
+  document.getElementById('ceCancellationDisplay').textContent = ca;
+  document.getElementById('ceFlaggedIndicator').style.display = c.flagged ? 'block' : 'none';
+  document.getElementById('customerEditForm').style.display = 'block';
+}
+
+function newCustomer() {
+  currentEditCustomer = null;
+  document.getElementById('customerEditTitle').textContent = 'New Customer';
+  document.getElementById('ceId').value          = '';
+  document.getElementById('ceName').value        = '';
+  document.getElementById('cePhone').value       = '';
+  document.getElementById('ceAddress').value     = '';
+  document.getElementById('ceNotes').value       = '';
+  document.getElementById('ceIsAccount').checked = false;
+  document.getElementById('ceBlocked').checked   = false;
+  document.getElementById('ceFavDests').value    = '';
+  document.getElementById('ceNoShowCount').value         = '0';
+  document.getElementById('ceNoShowDisplay').textContent = '0';
+  document.getElementById('ceCancellationCount').value         = '0';
+  document.getElementById('ceCancellationDisplay').textContent = '0';
+  document.getElementById('ceFlaggedIndicator').style.display = 'none';
+  document.getElementById('customerEditForm').style.display = 'block';
+  document.getElementById('ceName').focus();
+}
+
+function cancelCustomerEdit() {
+  document.getElementById('customerEditForm').style.display = 'none';
+  currentEditCustomer = null;
+}
+
+function resetNoShowCount() {
+  document.getElementById('ceNoShowCount').value = '0';
+  document.getElementById('ceNoShowDisplay').textContent = '0';
+  saveCustomer();
+}
+
+function resetCancellationCount() {
+  document.getElementById('ceCancellationCount').value = '0';
+  document.getElementById('ceCancellationDisplay').textContent = '0';
+  saveCustomer();
+}
+
+async function saveCustomer() {
+  const id      = document.getElementById('ceId').value.trim();
+  const name    = document.getElementById('ceName').value.trim();
+  const phone   = document.getElementById('cePhone').value.trim();
+  const address = document.getElementById('ceAddress').value.trim();
+  const notes   = document.getElementById('ceNotes').value.trim();
+  const isAcct   = document.getElementById('ceIsAccount').checked;
+  const blocked  = document.getElementById('ceBlocked').checked;
+  const noShows     = parseInt(document.getElementById('ceNoShowCount').value, 10) || 0;
+  const cancels     = parseInt(document.getElementById('ceCancellationCount').value, 10) || 0;
+  const favRaw      = document.getElementById('ceFavDests').value;
+  const favs        = favRaw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+  if (!name || !phone) { alert('Name and phone are required'); return; }
+  const url  = id ? '/api/customer/update' : '/api/customer/new';
+  const body = { id, name, phone, address, notes, is_account: isAcct, blocked, no_show_count: noShows, cancellation_count: cancels, favourite_destinations: favs };
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if (!resp.ok) { alert('Save failed: ' + (await resp.text())); return; }
+    document.getElementById('customerEditForm').style.display = 'none';
+    currentEditCustomer = null;
+    loadCustomers(document.getElementById('customerSearch').value);
+  } catch(e) {
+    alert('Save failed — check console');
+    console.error(e);
+  }
+}
 </script>
 <div id="prebookModal" style="display:none;"></div>
 </body>

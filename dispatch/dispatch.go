@@ -11,17 +11,14 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
+	"taxidemo/config"
 	"taxidemo/models"
 )
 
-// Simulation timing constants.
-const (
-	SimTickSeconds    = 5  // how often the simulation updates (seconds)
-	SimJourneyMinutes = 2  // how long a cross-town journey takes in the simulation
-)
 
 // destination represents a named drop-off point with GPS coordinates.
 type destination struct {
@@ -322,8 +319,8 @@ func approachMinutesForZone(zoneID string, state *models.AppState) int {
 			return z.AverageApproachMinutes
 		}
 	}
-	log.Printf("approachMinutesForZone: zone %q not found, using default 10 mins", zoneID)
-	return 10
+	log.Printf("approachMinutesForZone: zone %q not found, using default %d mins", zoneID, config.Policy.DefaultApproachMinutes)
+	return config.Policy.DefaultApproachMinutes
 }
 
 // runSchedulerCycle checks all pending prebooks and dispatches any that are due.
@@ -381,7 +378,7 @@ func activeJobForDriver(driverID string, state *models.AppState) *models.Job {
 // travels the full distance in exactly SimJourneyMinutes regardless of how far
 // apart the two points are.
 func simTick(state *models.AppState) {
-	const totalTicks = float64(SimJourneyMinutes*60) / float64(SimTickSeconds)
+	totalTicks := float64(config.Policy.SimJourneyMinutes*60) / float64(config.Policy.SimTickSeconds)
 	const arrivalThreshold = 0.0001 // ~10 metres in degrees
 
 	for _, driver := range state.Drivers {
@@ -446,12 +443,94 @@ func simTick(state *models.AppState) {
 	}
 }
 
+// normPhone strips spaces and dashes from a phone number for comparison.
+func normPhone(p string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(p, " ", ""), "-", "")
+}
+
+// IsLateWeekendBooking reports whether t falls within the late-night exclusion
+// window defined by cooperative policy (config.Policy). Bookings in this window
+// are excluded from the no-show count.
+//
+// The window spans midnight: e.g. a booking at 01:00 Saturday is considered part
+// of the Friday night window. When the hour is before LateNightEndHour the
+// previous calendar day is used to determine which night this belongs to.
+func IsLateWeekendBooking(t time.Time) bool {
+	if !config.Policy.ExcludeLateWeekend {
+		return false
+	}
+	h := t.Hour()
+	day := t.Weekday()
+
+	// Early-morning portion of the window (e.g. 00:00–03:59): the qualifying
+	// night started on the previous calendar day.
+	if h < config.Policy.LateNightEndHour {
+		prev := time.Weekday((int(day) + 6) % 7)
+		for _, d := range config.Policy.LateNightDays {
+			if d == prev {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Late-night portion of the window (e.g. 22:00–23:59): use current day.
+	if h >= config.Policy.LateNightStartHour {
+		for _, d := range config.Policy.LateNightDays {
+			if d == day {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ShouldFlagCustomer returns true if the customer identified by phone has
+// accumulated a weighted score high enough to trigger a flag under cooperative
+// policy. Both thresholds (absolute weighted score and weighted rate) must be
+// exceeded simultaneously.
+//
+// Weighted score = (NoShowCount × NoShowWeight) + (CancellationCount × CancellationWeight)
+//
+// No-shows are counted only when a driver arrived at the pickup and found
+// nobody there. Cancellations are counted when the passenger cancelled before
+// the driver reached the pickup. The late-night exclusion applies to no-shows
+// only — cancellations always count regardless of time.
+func ShouldFlagCustomer(phone string, customers []*models.Customer, bookings []*models.Booking) bool {
+	norm := normPhone(phone)
+	var cust *models.Customer
+	for _, c := range customers {
+		if normPhone(c.Phone) == norm {
+			cust = c
+			break
+		}
+	}
+	if cust == nil {
+		return false
+	}
+	weightedScore := float64(cust.NoShowCount)*config.Policy.NoShowWeight +
+		float64(cust.CancellationCount)*config.Policy.CancellationWeight
+	if weightedScore < float64(config.Policy.NoShowMinCount) {
+		return false
+	}
+	total := 0
+	for _, b := range bookings {
+		if normPhone(b.Phone) == norm {
+			total++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return weightedScore/float64(total) > config.Policy.NoShowMinRate
+}
+
 // StartSimulation launches a goroutine that moves dispatched drivers towards their
 // bookings every SimTickSeconds seconds.
 func StartSimulation(state *models.AppState) {
-	log.Printf("dispatch simulation started (%ds tick, %dmin journey)", SimTickSeconds, SimJourneyMinutes)
+	log.Printf("dispatch simulation started (%ds tick, %dmin journey)", config.Policy.SimTickSeconds, config.Policy.SimJourneyMinutes)
 	go func() {
-		ticker := time.NewTicker(SimTickSeconds * time.Second)
+		ticker := time.NewTicker(time.Duration(config.Policy.SimTickSeconds) * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			state.Mu.Lock()
