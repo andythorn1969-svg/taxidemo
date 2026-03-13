@@ -16,8 +16,10 @@ import (
 type DriverStatus string
 
 const (
-	StatusAvailable DriverStatus = "available"
-	StatusBusy      DriverStatus = "busy"
+	StatusAvailable  DriverStatus = "available"
+	StatusBusy       DriverStatus = "busy"
+	StatusDispatched DriverStatus = "dispatched" // en route to pickup
+	StatusOnJob      DriverStatus = "on_job"     // passenger aboard, en route to destination
 )
 
 // Driver represents a taxi driver in the cooperative.
@@ -86,6 +88,7 @@ type Booking struct {
 	IsAccount     bool
 	PickupAddress string
 	DestAddress   string
+	DestZone      string
 	RequestedTime time.Time
 	CompletedAt   *time.Time
 }
@@ -107,6 +110,16 @@ type Job struct {
 	Driver    *Driver
 	Status    JobStatus
 	OfferedAt time.Time
+
+	// Fixed step deltas computed once on the first simulation tick of each leg.
+	// Using a fixed step ensures the driver travels the full distance in exactly
+	// SimJourneyMinutes regardless of geographic distance.
+	PickupStepSet bool
+	PickupStepLat float64
+	PickupStepLng float64
+	DestStepSet   bool
+	DestStepLat   float64
+	DestStepLng   float64
 }
 
 // Customer represents a known passenger, potentially an account holder.

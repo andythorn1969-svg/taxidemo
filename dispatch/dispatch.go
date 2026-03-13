@@ -17,6 +17,12 @@ import (
 	"taxidemo/models"
 )
 
+// Simulation timing constants.
+const (
+	SimTickSeconds    = 5  // how often the simulation updates (seconds)
+	SimJourneyMinutes = 2  // how long a cross-town journey takes in the simulation
+)
+
 // destination represents a named drop-off point with GPS coordinates.
 type destination struct {
 	Name string
@@ -185,7 +191,7 @@ func DispatchJob(booking *models.Booking, zones []*models.Zone) *models.Job {
 			// Driver accepts - remove them from their zone queue.
 			fmt.Printf("  %s accepted the job\n", driver.Name)
 			removeDriverFromZone(driver, zones)
-			driver.Status = models.StatusBusy
+			driver.Status = models.StatusDispatched
 			job.Driver = driver
 			job.Status = models.JobAccepted
 			booking.Status = models.BookingDispatched
@@ -227,8 +233,10 @@ func zoneNameForDriver(driver *models.Driver, zones []*models.Zone) string {
 }
 
 // GenerateID returns a unique string ID with the given prefix.
+// Uses rand.Int63() rather than time.Now().UnixNano() so that IDs remain
+// unique when many bookings are created within the same nanosecond (e.g. seed data).
 func GenerateID(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	return fmt.Sprintf("%s-%d", prefix, rand.Int63())
 }
 
 // CompleteBooking marks a booking as completed and returns its driver to available status.
@@ -351,6 +359,104 @@ func StartScheduler(state *models.AppState) {
 		defer ticker.Stop()
 		for range ticker.C {
 			runSchedulerCycle(state)
+		}
+	}()
+}
+
+// activeJobForDriver returns the accepted job currently assigned to the given driver,
+// or nil if no such job exists.
+func activeJobForDriver(driverID string, state *models.AppState) *models.Job {
+	for _, j := range state.Jobs {
+		if j.Driver != nil && j.Driver.ID == driverID && j.Status == models.JobAccepted {
+			return j
+		}
+	}
+	return nil
+}
+
+// simTick advances driver positions by one simulation step.
+// Must be called with state.Mu held for writing.
+//
+// A fixed linear step is computed once at the start of each leg so the driver
+// travels the full distance in exactly SimJourneyMinutes regardless of how far
+// apart the two points are.
+func simTick(state *models.AppState) {
+	const totalTicks = float64(SimJourneyMinutes*60) / float64(SimTickSeconds)
+	const arrivalThreshold = 0.0001 // ~10 metres in degrees
+
+	for _, driver := range state.Drivers {
+		switch driver.Status {
+
+		case models.StatusDispatched:
+			job := activeJobForDriver(driver.ID, state)
+			if job == nil {
+				continue
+			}
+			targetLat, targetLng := job.Booking.Lat, job.Booking.Lng
+			// Compute the fixed per-tick step on the first tick of this leg.
+			if !job.PickupStepSet {
+				job.PickupStepLat = (targetLat - driver.Lat) / totalTicks
+				job.PickupStepLng = (targetLng - driver.Lng) / totalTicks
+				job.PickupStepSet = true
+			}
+			dlat := targetLat - driver.Lat
+			dlng := targetLng - driver.Lng
+			if math.Sqrt(dlat*dlat+dlng*dlng) < arrivalThreshold {
+				driver.Lat = targetLat
+				driver.Lng = targetLng
+				driver.Status = models.StatusOnJob
+			} else {
+				driver.Lat += job.PickupStepLat
+				driver.Lng += job.PickupStepLng
+			}
+
+		case models.StatusOnJob:
+			job := activeJobForDriver(driver.ID, state)
+			if job == nil {
+				continue
+			}
+			targetLat, targetLng := job.Booking.DestLat, job.Booking.DestLng
+			if targetLat == 0 && targetLng == 0 {
+				continue // no destination coordinates set
+			}
+			// Compute the fixed per-tick step on the first tick of this leg.
+			if !job.DestStepSet {
+				job.DestStepLat = (targetLat - driver.Lat) / totalTicks
+				job.DestStepLng = (targetLng - driver.Lng) / totalTicks
+				job.DestStepSet = true
+			}
+			dlat := targetLat - driver.Lat
+			dlng := targetLng - driver.Lng
+			if math.Sqrt(dlat*dlat+dlng*dlng) < arrivalThreshold {
+				// Arrived at destination — complete the job inline.
+				driver.Lat = targetLat
+				driver.Lng = targetLng
+				driver.Status = models.StatusAvailable
+				driver.FreeAt = time.Now()
+				now := time.Now()
+				job.Booking.Status = models.BookingCompleted
+				job.Booking.CompletedAt = &now
+				job.Status = models.JobCompleted
+				log.Printf("simulation: driver %s completed job %s", driver.Name, job.ID)
+			} else {
+				driver.Lat += job.DestStepLat
+				driver.Lng += job.DestStepLng
+			}
+		}
+	}
+}
+
+// StartSimulation launches a goroutine that moves dispatched drivers towards their
+// bookings every SimTickSeconds seconds.
+func StartSimulation(state *models.AppState) {
+	log.Printf("dispatch simulation started (%ds tick, %dmin journey)", SimTickSeconds, SimJourneyMinutes)
+	go func() {
+		ticker := time.NewTicker(SimTickSeconds * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			state.Mu.Lock()
+			simTick(state)
+			state.Mu.Unlock()
 		}
 	}()
 }

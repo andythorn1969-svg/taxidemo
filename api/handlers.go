@@ -71,6 +71,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/booking/new", h.HandleNewBooking)
 	mux.HandleFunc("/api/booking/complete", h.HandleCompleteBooking)
 	mux.HandleFunc("/api/booking/cancel", h.HandleCancelBooking)
+	mux.HandleFunc("/api/booking/update", h.HandleUpdateBooking)
 	mux.HandleFunc("/api/prebooks", h.HandlePrebookData)
 }
 
@@ -358,6 +359,11 @@ func (h *Handler) HandleNewBooking(w http.ResponseWriter, r *http.Request) {
 		pickupZone = dispatch.NearestZone(req.PickupLat, req.PickupLng)
 	}
 
+	destZone := ""
+	if req.DestLat != 0 || req.DestLng != 0 {
+		destZone = dispatch.NearestZone(req.DestLat, req.DestLng)
+	}
+
 	booking := &models.Booking{
 		ID:            dispatch.GenerateID("BK"),
 		Passenger:     req.CustomerName,
@@ -372,6 +378,7 @@ func (h *Handler) HandleNewBooking(w http.ResponseWriter, r *http.Request) {
 		DestAddress:   req.DestAddress,
 		DestLat:       req.DestLat,
 		DestLng:       req.DestLng,
+		DestZone:      destZone,
 		Source:        models.SourceApp,
 		Status:        models.BookingPending,
 		Type:          models.BookingType(req.Type),
@@ -425,6 +432,80 @@ func (h *Handler) HandleCancelBooking(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"ok":true}`)
 }
 
+// HandleUpdateBooking updates mutable fields on an existing booking by ID.
+func (h *Handler) HandleUpdateBooking(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID            string  `json:"id"`
+		Type          string  `json:"type"`
+		CustomerName  string  `json:"customer_name"`
+		Phone         string  `json:"phone"`
+		Notes         string  `json:"notes"`
+		IsAccount     bool    `json:"is_account"`
+		PickupAddress string  `json:"pickup_address"`
+		PickupLat     float64 `json:"pickup_lat"`
+		PickupLng     float64 `json:"pickup_lng"`
+		DestAddress   string  `json:"dest_address"`
+		DestLat       float64 `json:"dest_lat"`
+		DestLng       float64 `json:"dest_lng"`
+		RequestedTime string  `json:"requested_time"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.State.Mu.Lock()
+	var booking *models.Booking
+	for _, b := range h.State.Bookings {
+		if b.ID == req.ID {
+			booking = b
+			break
+		}
+	}
+	if booking == nil {
+		h.State.Mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"error":"booking %q not found"}`, req.ID)
+		return
+	}
+
+	booking.CustomerName  = req.CustomerName
+	booking.Passenger     = req.CustomerName
+	booking.Phone         = req.Phone
+	booking.Notes         = req.Notes
+	booking.IsAccount     = req.IsAccount
+	booking.PickupAddress = req.PickupAddress
+	booking.Lat           = req.PickupLat
+	booking.Lng           = req.PickupLng
+	booking.DestAddress   = req.DestAddress
+	booking.DestLat       = req.DestLat
+	booking.DestLng       = req.DestLng
+	booking.Type          = models.BookingType(req.Type)
+
+	if req.Type == string(models.BookingPrebook) && req.RequestedTime != "" {
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02T15:04"} {
+			if t, err := time.ParseInLocation(layout, req.RequestedTime, time.Local); err == nil {
+				booking.RequestedTime = t
+				break
+			}
+		}
+	}
+
+	if req.PickupLat != 0 || req.PickupLng != 0 {
+		booking.PickupZone = dispatch.NearestZone(req.PickupLat, req.PickupLng)
+	}
+	h.State.Mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(booking)
+}
+
 // HandlePrebookData returns pre-booked bookings, optionally filtered by status.
 // Query param: filter = active | completed | all (default: all)
 func (h *Handler) HandlePrebookData(w http.ResponseWriter, r *http.Request) {
@@ -436,43 +517,76 @@ func (h *Handler) HandlePrebookData(w http.ResponseWriter, r *http.Request) {
 	h.State.Mu.RLock()
 	all := make([]*models.Booking, len(h.State.Bookings))
 	copy(all, h.State.Bookings)
+
+	// Build zone ID → name lookup.
+	zoneNames := make(map[string]string, len(h.State.Zones))
+	for _, z := range h.State.Zones {
+		zoneNames[z.ID] = z.Name
+	}
+
+	// Build booking ID → assigned driver name from accepted/completed jobs.
+	assignedDriver := make(map[string]string)
+	for _, j := range h.State.Jobs {
+		if j.Driver != nil && (j.Status == models.JobAccepted || j.Status == models.JobCompleted) {
+			assignedDriver[j.Booking.ID] = j.Driver.Name
+		}
+	}
 	h.State.Mu.RUnlock()
 
+	resolveName := func(id string) string {
+		if id == "" {
+			return ""
+		}
+		if name, ok := zoneNames[id]; ok {
+			return name
+		}
+		return id
+	}
+
 	type prebookJSON struct {
-		ID            string  `json:"id"`
-		CustomerName  string  `json:"customer_name"`
-		Phone         string  `json:"phone"`
-		PickupAddress string  `json:"pickup_address"`
-		DestAddress   string  `json:"dest_address"`
-		PickupZone    string  `json:"pickup_zone"`
-		Status        string  `json:"status"`
-		Type          string  `json:"type"`
-		RequestedTime string  `json:"requested_time"`
-		Notes         string  `json:"notes"`
-		IsAccount     bool    `json:"is_account"`
-		Lat           float64 `json:"lat"`
-		Lng           float64 `json:"lng"`
-		DestLat       float64 `json:"dest_lat"`
-		DestLng       float64 `json:"dest_lng"`
+		ID             string  `json:"id"`
+		CustomerName   string  `json:"customer_name"`
+		Phone          string  `json:"phone"`
+		PickupAddress  string  `json:"pickup_address"`
+		DestAddress    string  `json:"dest_address"`
+		PickupZone     string  `json:"pickup_zone"`
+		DestZone       string  `json:"dest_zone"`
+		AssignedDriver string  `json:"assigned_driver"`
+		Status         string  `json:"status"`
+		Type           string  `json:"type"`
+		RequestedTime  string  `json:"requested_time"`
+		Notes          string  `json:"notes"`
+		IsAccount      bool    `json:"is_account"`
+		Lat            float64 `json:"lat"`
+		Lng            float64 `json:"lng"`
+		DestLat        float64 `json:"dest_lat"`
+		DestLng        float64 `json:"dest_lng"`
 	}
 
 	toJSON := func(b *models.Booking) prebookJSON {
 		return prebookJSON{
-			ID:            b.ID,
-			CustomerName:  b.CustomerName,
-			Phone:         b.Phone,
-			PickupAddress: b.PickupAddress,
-			DestAddress:   b.DestAddress,
-			PickupZone:    b.PickupZone,
-			Status:        string(b.Status),
-			Type:          string(b.Type),
-			RequestedTime: b.RequestedTime.Format(time.RFC3339),
-			Notes:         b.Notes,
-			IsAccount:     b.IsAccount,
-			Lat:           b.Lat,
-			Lng:           b.Lng,
-			DestLat:       b.DestLat,
-			DestLng:       b.DestLng,
+			ID:             b.ID,
+			CustomerName:   b.CustomerName,
+			Phone:          b.Phone,
+			PickupAddress:  b.PickupAddress,
+			DestAddress:    func() string {
+				if b.DestAddress != "" {
+					return b.DestAddress
+				}
+				return b.Destination
+			}(),
+			PickupZone:     resolveName(b.PickupZone),
+			DestZone:       resolveName(b.DestZone),
+			AssignedDriver: assignedDriver[b.ID],
+			Status:         string(b.Status),
+			Type:           string(b.Type),
+			RequestedTime:  b.RequestedTime.Format(time.RFC3339),
+			Notes:          b.Notes,
+			IsAccount:      b.IsAccount,
+			Lat:             b.Lat,
+			Lng:             b.Lng,
+			DestLat:        b.DestLat,
+			DestLng:        b.DestLng,
 		}
 	}
 
@@ -533,21 +647,31 @@ const indexHTML = `<!DOCTYPE html>
 html,body{height:100%;overflow:hidden}
 body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:flex;flex-direction:column}
 /* Top bar */
-.topbar{flex-shrink:0;background:#0a0a14;border-bottom:1px solid #1e2a3a;padding:8px 16px;display:flex;align-items:center;gap:16px}
-.topbar h1{color:#4fc3f7;font-size:1rem;letter-spacing:.5px;white-space:nowrap;margin-right:auto}
-.topbar form{display:flex;align-items:center;gap:10px}
-.topbar .fg{display:flex;align-items:center;gap:5px}
-.topbar label{font-size:.72rem;color:#78909c;white-space:nowrap}
-.topbar select,.topbar input[type=text]{background:#0d0d1a;border:1px solid #2a3a4a;color:#e0e0e0;padding:5px 9px;border-radius:5px;font-size:.83rem}
-.topbar input[type=text]{min-width:160px}
-.topbar select:focus,.topbar input:focus{outline:none;border-color:#4fc3f7}
-.topbar button{background:#1565c0;color:#fff;border:none;padding:6px 16px;border-radius:5px;font-size:.83rem;cursor:pointer}
-.topbar button:hover{background:#1976d2}
-/* Main two-column layout */
-.main{flex:1;display:flex;overflow:hidden}
-/* Left column — zone queues */
-.left-col{width:35%;min-width:240px;max-width:380px;overflow-y:auto;padding:10px 12px;border-right:1px solid #1e2a3a;flex-shrink:0}
-.left-col h2{color:#90caf9;font-size:.7rem;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px}
+.topbar{flex-shrink:0;background:#0a0a14;border-bottom:1px solid #1e2a3a;padding:8px 16px;display:flex;align-items:center}
+.topbar h1{color:#4fc3f7;font-size:1rem;letter-spacing:.5px}
+/* Main layout — three columns side by side, full height */
+.main{flex:1;display:flex;flex-direction:row;overflow:hidden}
+.left-col{width:22%;flex-shrink:0;height:100%;overflow-y:auto;padding:10px 12px;border-right:1px solid #1e2a3a}
+.mid-col{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.right-col{width:25%;flex-shrink:0;height:100%;overflow-y:auto;padding:10px 12px;border-left:1px solid #1e2a3a}
+/* Map: fixed height inside centre column */
+#map{height:50vh;flex-shrink:0;border-radius:8px;border:1px solid #1e2a3a}
+/* Bookings panel: fills remaining space in centre column */
+.bookings-panel{flex:1;overflow-y:auto;border-top:1px solid #1e2a3a;background:#0d0d1a}
+/* Shared panel heading */
+.panel-heading{color:#90caf9;font-size:.68rem;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:10px}
+/* Booking form */
+.form-row{margin-bottom:10px}
+.form-label{display:block;font-size:.68rem;color:#78909c;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}
+.form-input{width:100%;padding:7px 9px;background:#0d1220;border:1px solid #2a3a4a;color:#e0e0e0;border-radius:4px;font-size:.82rem;font-family:'Segoe UI',sans-serif;box-sizing:border-box}
+.form-input:focus{outline:none;border-color:#4fc3f7}
+.geocode-row{display:flex;gap:6px;align-items:center}
+.geocode-status{font-size:16px;width:22px;text-align:center;flex-shrink:0}
+.geocode-hint{font-size:.66rem;color:#546e7a;margin-top:3px}
+.mode-btn{flex:1;padding:8px;border-radius:4px;cursor:pointer;font-size:.78rem;font-family:'Segoe UI',sans-serif}
+.confirm-btn{width:100%;padding:10px;background:#1565c0;color:#fff;border:none;border-radius:5px;font-size:.88rem;cursor:pointer;font-family:'Segoe UI',sans-serif;font-weight:600;margin-top:6px}
+.confirm-btn:hover{background:#1976d2}
+/* Zone trap queues */
 .zones-grid{display:flex;flex-direction:column;gap:6px}
 .zone-card{background:#131325;border:1px solid #1e2a3a;border-radius:6px;padding:7px 9px}
 .zone-card h3{color:#4fc3f7;font-size:.76rem;margin-bottom:5px;border-bottom:1px solid #1e2a3a;padding-bottom:4px}
@@ -560,22 +684,12 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
 .badge-available{background:#1b3a20;color:#81c784}
 .badge-busy{background:#3a1a10;color:#ff8a65}
 .empty{color:#37474f;font-size:.74rem;font-style:italic}
-/* Right column — map + log */
-.right-col{flex:1;display:flex;flex-direction:column;overflow:hidden;padding:10px 12px;gap:8px;min-width:0}
-#map{flex:1;min-height:500px;border-radius:8px;border:1px solid #1e2a3a}
-/* Dispatch log */
-.log-section{flex-shrink:0}
-.log-section h2{color:#90caf9;font-size:.7rem;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px}
-.log-card{background:#131325;border:1px solid #1e2a3a;border-radius:6px;padding:8px 10px;max-height:180px;overflow-y:auto}
-.log-entry{display:grid;grid-template-columns:52px 1fr 1fr 1fr 80px;align-items:center;gap:8px;padding:5px 2px;border-bottom:1px solid #1a1a2e;font-size:.76rem}
-.log-entry:last-child{border-bottom:none}
-.log-id{color:#37474f;font-size:.68rem}
-.log-zone{color:#78909c}
-.log-driver{color:#90caf9}
-.log-status-accepted{color:#66bb6a;text-align:right}
-.log-status-declined{color:#ef5350;text-align:right}
-.log-status-offered{color:#ffa726;text-align:right}
-.no-jobs{color:#37474f;font-style:italic;font-size:.76rem}
+/* Override inline max-height on the table wrapper div inside bookings panel */
+.bookings-panel>div+div{max-height:none!important;overflow-y:visible!important}
+/* Jobs table density */
+#jobsTable{font-size:11px!important}
+#jobsTable td,#jobsTable th{padding:5px 8px!important}
+/* Leaflet */
 .leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#1a1a2e;color:#e0e0e0;border:1px solid #2a3a4a}
 .leaflet-popup-content b{color:#4fc3f7}
 </style>
@@ -584,76 +698,120 @@ body{background:#0d0d1a;color:#e0e0e0;font-family:'Segoe UI',sans-serif;display:
 
 <div class="topbar">
   <h1>Southend Taxi Cooperative &mdash; Dispatch</h1>
-  <form action="/dispatch" method="POST">
-    <div class="fg"><label>Zone</label><select name="zone">{{range .Zones}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></div>
-    <div class="fg"><label>Passenger</label><input type="text" name="passenger" placeholder="e.g. Jane Smith" required></div>
-    <button type="submit">Dispatch</button>
-  </form>
 </div>
 
 <div class="main">
-  <div class="left-col">
-    <h2>Zone Trap Queues</h2>
-    <div class="zones-grid">
-    {{range .Zones}}<div class="zone-card">
-      <h3>{{.Name}}</h3>
-      {{if .Drivers}}{{range $i, $d := .Drivers}}<div class="driver-row">
-        <span class="trap">T{{inc $i}}</span>
-        <span class="dname">{{$d.Name}}</span>
-        <span class="wait">{{waitMins $d}}m</span>
-        <span class="badge {{badgeClass $d.Status}}">{{$d.Status}}</span>
-      </div>{{end}}
-      {{else}}<p class="empty">No drivers</p>{{end}}
-    </div>{{end}}
-    </div>
-  </div>
 
-  <div class="right-col">
-    <div id="map"></div>
-    <div class="log-section">
-      <h2>Dispatch Log</h2>
-      <div class="log-card">
-        {{if .Jobs}}{{range .Jobs}}<div class="log-entry">
-          <span class="log-id">{{.ID}}</span>
-          <span>{{.Booking.Passenger}}</span>
-          <span class="log-zone">{{zoneName .Booking.PickupZone}}</span>
-          <span class="log-driver">{{if .Driver}}{{.Driver.Name}}{{else}}&mdash;{{end}}</span>
-          <span class="log-status-{{.Status}}">{{.Status}}</span>
-        </div>{{end}}
-        {{else}}<p class="no-jobs">No dispatches yet</p>{{end}}
+    <!-- LEFT: booking form panel -->
+    <div class="left-col">
+      <h2 class="panel-heading">New Booking</h2>
+      <div class="form-row">
+        <div style="display:flex;gap:6px;">
+          <button id="modeImmediate" class="mode-btn" style="border:2px solid #4fc3f7;background:#0d2233;color:#4fc3f7;" onclick="setBookingMode('immediate')">⚡ Immediate</button>
+          <button id="modePrebook" class="mode-btn" style="border:2px solid #2a3a4a;background:transparent;color:#546e7a;" onclick="setBookingMode('prebook')">🕐 Pre-book</button>
+        </div>
+      </div>
+      <div id="prebookTimeRow" class="form-row" style="display:none;">
+        <label class="form-label">Pickup date &amp; time</label>
+        <input id="bkRequestedTime" type="datetime-local" class="form-input" />
+      </div>
+      <div class="form-row">
+        <label class="form-label">Passenger name</label>
+        <input id="bkCustomerName" type="text" class="form-input" placeholder="e.g. Jane Smith" />
+      </div>
+      <div class="form-row">
+        <label class="form-label">Phone</label>
+        <input id="bkPhone" type="tel" class="form-input" placeholder="e.g. 01702 123456" />
+      </div>
+      <div class="form-row">
+        <label class="form-label">Pickup address</label>
+        <div class="geocode-row">
+          <input id="bkPickupAddress" type="text" class="form-input" placeholder="e.g. 42 London Road, Southend" onblur="geocodeAddress('pickup')" />
+          <span id="bkPickupStatus" class="geocode-status"></span>
+        </div>
+        <div id="bkPickupZoneTag" class="geocode-hint"></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Destination address</label>
+        <div class="geocode-row">
+          <input id="bkDestAddress" type="text" class="form-input" placeholder="e.g. Southend Airport" onblur="geocodeAddress('dest')" />
+          <span id="bkDestStatus" class="geocode-status"></span>
+        </div>
+        <div id="bkDestZoneTag" class="geocode-hint"></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Notes</label>
+        <textarea id="bkNotes" rows="2" class="form-input" placeholder="e.g. wheelchair access, large luggage" style="resize:vertical;"></textarea>
+      </div>
+      <div class="form-row" style="display:flex;align-items:center;gap:8px;">
+        <input id="bkIsAccount" type="checkbox" style="width:15px;height:15px;" />
+        <label for="bkIsAccount" style="font-size:.8rem;color:#90caf9;cursor:pointer;">Account customer</label>
+      </div>
+      <button class="confirm-btn" onclick="submitBooking()">&#10003; Confirm Booking</button>
+    </div>
+
+    <!-- CENTRE: map + bookings panel -->
+    <div class="mid-col">
+      <div id="map">
+        <div style="position:absolute;bottom:24px;left:8px;z-index:1000;background:rgba(13,13,26,0.88);border:1px solid #1e2a3a;border-radius:6px;padding:8px 11px;font-family:monospace;font-size:11px;color:#b0bec5;line-height:1.9;pointer-events:none;">
+          <div><span style="display:inline-block;width:14px;height:14px;background:#2e7d32;border:2px solid #81c784;border-radius:3px;vertical-align:middle;margin-right:6px;"></span>Available driver</div>
+          <div><span style="display:inline-block;width:14px;height:14px;background:#c62828;border:2px solid #ef9a9a;border-radius:3px;vertical-align:middle;margin-right:6px;"></span>Dispatched / On job</div>
+          <div><span style="display:inline-block;width:14px;height:14px;background:#1565c0;border:2px solid #90caf9;border-radius:50%;vertical-align:middle;margin-right:6px;"></span>Pickup point</div>
+          <div><span style="display:inline-block;width:14px;height:14px;background:#7b1fa2;border:2px solid #ce93d8;border-radius:50%;vertical-align:middle;margin-right:6px;"></span>Destination</div>
+          <div style="margin-top:4px;padding-top:4px;border-top:1px solid #1e2a3a;color:#546e7a;">Zone boundaries shown</div>
+        </div>
+      </div>
+      <div class="bookings-panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:#111122;border-bottom:1px solid #1e2a3a;">
+          <span style="color:#4fc3f7;font-size:.68rem;text-transform:uppercase;letter-spacing:1.5px;font-weight:bold;">Bookings</span>
+          <div style="display:flex;gap:6px;">
+            <button onclick="setJobFilter('active')" id="filterActive" style="padding:4px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:1px solid #4fc3f7;background:#0d2233;color:#4fc3f7;">ACTIVE</button>
+            <button onclick="setJobFilter('completed')" id="filterCompleted" style="padding:4px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:1px solid #2a3a4a;background:transparent;color:#546e7a;">COMPLETED</button>
+            <button onclick="setJobFilter('all')" id="filterAll" style="padding:4px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:1px solid #2a3a4a;background:transparent;color:#546e7a;">ALL</button>
+            <button onclick="openPrebookModal()" style="padding:4px 12px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:none;background:#1565c0;color:#fff;font-weight:bold;margin-left:8px;">+ NEW BOOKING</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto;max-height:160px;overflow-y:auto;">
+          <table id="jobsTable" style="width:100%;border-collapse:collapse;font-family:monospace;font-size:12px;">
+            <thead>
+              <tr style="background:#111122;color:#546e7a;text-align:left;">
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">TIME</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">PASSENGER</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">PICKUP</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">ZONE</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">DESTINATION</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">DEST ZONE</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">DRIVER</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;">STATUS</th>
+                <th style="padding:6px 10px;border-bottom:1px solid #1e2a3a;"></th>
+              </tr>
+            </thead>
+            <tbody id="jobsTableBody">
+              <tr><td colspan="9" style="padding:16px;text-align:center;color:#37474f;font-family:monospace;">No bookings yet</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
-<div style="margin-top:12px;background:#0d0d1a;border:1px solid #333;border-radius:6px;overflow:hidden;">
-  <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#111122;border-bottom:1px solid #333;">
-    <span style="color:#00d4ff;font-family:monospace;font-size:13px;font-weight:bold;">📋 BOOKINGS</span>
-    <div style="display:flex;gap:6px;">
-      <button onclick="setJobFilter('active')" id="filterActive" style="padding:4px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:1px solid #00d4ff;background:#00d4ff22;color:#00d4ff;">ACTIVE</button>
-      <button onclick="setJobFilter('completed')" id="filterCompleted" style="padding:4px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:1px solid #444;background:transparent;color:#666;">COMPLETED</button>
-      <button onclick="setJobFilter('all')" id="filterAll" style="padding:4px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:1px solid #444;background:transparent;color:#666;">ALL</button>
-      <button onclick="openPrebookModal()" style="padding:4px 12px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer;border:none;background:#00d4ff;color:#000;font-weight:bold;margin-left:8px;">+ NEW BOOKING</button>
+
+    <!-- RIGHT: zone trap queues -->
+    <div class="right-col">
+      <h2 class="panel-heading">Zone Trap Queues</h2>
+      <div class="zones-grid">
+      {{range .Zones}}<div class="zone-card">
+        <h3>{{.Name}}</h3>
+        {{if .Drivers}}{{range $i, $d := .Drivers}}<div class="driver-row">
+          <span class="trap">T{{inc $i}}</span>
+          <span class="dname">{{$d.Name}}</span>
+          <span class="wait">{{waitMins $d}}m</span>
+          <span class="badge {{badgeClass $d.Status}}">{{$d.Status}}</span>
+        </div>{{end}}
+        {{else}}<p class="empty">No drivers</p>{{end}}
+      </div>{{end}}
+      </div>
     </div>
-  </div>
-  <div style="overflow-x:auto;">
-    <table id="jobsTable" style="width:100%;border-collapse:collapse;font-family:monospace;font-size:12px;">
-      <thead>
-        <tr style="background:#111122;color:#666;text-align:left;">
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">TIME</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">PASSENGER</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">PICKUP</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">ZONE</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">DESTINATION</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">DRIVER</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;">STATUS</th>
-          <th style="padding:8px 10px;border-bottom:1px solid #222;"></th>
-        </tr>
-      </thead>
-      <tbody id="jobsTableBody">
-        <tr><td colspan="8" style="padding:20px;text-align:center;color:#555;font-family:monospace;">No bookings yet</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-  </div>
+
+
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -806,13 +964,16 @@ setInterval(refreshZones, 5000);
 setInterval(refreshDrivers, 5000);
 setInterval(refreshBookings, 5000);
 
-// ─── Booking modal state ────────────────────────────────────────────────────
+// ─── Booking form state ──────────────────────────────────────────────────────
 let bookingMode = 'immediate';
 let pickupCoords = null;
 let destCoords = null;
 let pickupMarker = null;
 let destMarker = null;
 let jobFilter = 'active';
+let editingBookingId = null;
+let currentBookings = [];
+let selectedRow = null;
 
 // ─── Modal open/close ───────────────────────────────────────────────────────
 function openPrebookModal() {
@@ -911,8 +1072,119 @@ async function geocodeAddress(type) {
   }
 }
 
+// ─── Edit mode ───────────────────────────────────────────────────────────────
+function enterEditMode(b) {
+  editingBookingId = b.id;
+
+  const heading = document.querySelector('.panel-heading');
+  heading.innerHTML = 'Edit Booking<span style="display:block;font-size:.6rem;color:#546e7a;font-weight:normal;letter-spacing:0;margin-top:2px;">' + b.id + '</span>';
+
+  document.getElementById('bkCustomerName').value = b.customer_name || '';
+  document.getElementById('bkPhone').value         = b.phone || '';
+  document.getElementById('bkPickupAddress').value = b.pickup_address || '';
+  document.getElementById('bkDestAddress').value   = b.dest_address || '';
+  document.getElementById('bkNotes').value         = b.notes || '';
+  document.getElementById('bkIsAccount').checked   = !!b.is_account;
+
+  if (b.lat && b.lng)           pickupCoords = {lat: b.lat, lng: b.lng};
+  if (b.dest_lat && b.dest_lng) destCoords   = {lat: b.dest_lat, lng: b.dest_lng};
+
+  setBookingMode(b.type === 'prebook' ? 'prebook' : 'immediate');
+  if (b.type === 'prebook' && b.requested_time) {
+    const dt = new Date(b.requested_time);
+    dt.setMinutes(dt.getMinutes() - dt.getTimezoneOffset());
+    document.getElementById('bkRequestedTime').value = dt.toISOString().slice(0, 16);
+  }
+
+  document.getElementById('bkPickupStatus').textContent  = b.lat      ? '✅' : '';
+  document.getElementById('bkPickupZoneTag').textContent = b.lat      ? 'Coordinates loaded from booking' : '';
+  document.getElementById('bkDestStatus').textContent    = b.dest_lat ? '✅' : '';
+  document.getElementById('bkDestZoneTag').textContent   = b.dest_lat ? 'Coordinates loaded from booking' : '';
+
+  const confirmBtn = document.querySelector('.confirm-btn');
+  confirmBtn.textContent = '✓ Update Booking';
+
+  let cancelBtn = document.getElementById('bkCancelEditBtn');
+  if (!cancelBtn) {
+    cancelBtn = document.createElement('button');
+    cancelBtn.id = 'bkCancelEditBtn';
+    cancelBtn.textContent = 'Cancel edit';
+    cancelBtn.style.cssText = 'width:100%;padding:8px;margin-top:6px;background:transparent;border:1px solid #2a3a4a;color:#78909c;border-radius:5px;font-size:.82rem;cursor:pointer;font-family:\'Segoe UI\',sans-serif;';
+    cancelBtn.onclick = exitEditMode;
+    confirmBtn.insertAdjacentElement('afterend', cancelBtn);
+  }
+  cancelBtn.style.display = 'block';
+}
+
+function exitEditMode() {
+  editingBookingId = null;
+  document.querySelector('.panel-heading').textContent = 'New Booking';
+  const cancelBtn = document.getElementById('bkCancelEditBtn');
+  if (cancelBtn) cancelBtn.style.display = 'none';
+  document.querySelector('.confirm-btn').textContent = '✓ Confirm Booking';
+  if (selectedRow) {
+    selectedRow.style.borderLeft = '3px solid transparent';
+    selectedRow.style.background = '';
+    selectedRow = null;
+  }
+  resetBookingForm();
+}
+
+function selectBookingRow(id, rowEl) {
+  if (selectedRow) {
+    selectedRow.style.borderLeft = '3px solid transparent';
+    selectedRow.style.background = '';
+  }
+  const b = currentBookings.find(x => x.id === id);
+  if (!b) return;
+  selectedRow = rowEl;
+  rowEl.style.borderLeft = '3px solid #4fc3f7';
+  rowEl.style.background = '#0d1e2d';
+  enterEditMode(b);
+}
+
+// ─── Update booking ──────────────────────────────────────────────────────────
+async function updateBooking(id) {
+  if (!pickupCoords) {
+    alert('Please enter and locate a pickup address first.');
+    return;
+  }
+  const body = {
+    id:             id,
+    type:           bookingMode,
+    customer_name:  document.getElementById('bkCustomerName').value.trim(),
+    phone:          document.getElementById('bkPhone').value.trim(),
+    notes:          document.getElementById('bkNotes').value.trim(),
+    is_account:     document.getElementById('bkIsAccount').checked,
+    pickup_address: document.getElementById('bkPickupAddress').value.trim(),
+    pickup_lat:     pickupCoords.lat,
+    pickup_lng:     pickupCoords.lng,
+    dest_address:   document.getElementById('bkDestAddress').value.trim(),
+    dest_lat:       destCoords ? destCoords.lat : 0,
+    dest_lng:       destCoords ? destCoords.lng : 0,
+    requested_time: bookingMode === 'prebook'
+      ? document.getElementById('bkRequestedTime').value
+      : new Date().toISOString()
+  };
+  try {
+    const resp = await fetch('/api/booking/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const result = await resp.json();
+    if (result.error) { alert('Update error: ' + result.error); return; }
+    exitEditMode();
+    loadJobs();
+  } catch(e) {
+    alert('Failed to update booking — check console');
+    console.error(e);
+  }
+}
+
 // ─── Submit booking ─────────────────────────────────────────────────────────
 async function submitBooking() {
+  if (editingBookingId) { await updateBooking(editingBookingId); return; }
   if (!pickupCoords) {
     alert('Please enter and locate a pickup address first.');
     return;
@@ -966,6 +1238,7 @@ async function loadJobs() {
   try {
     const resp = await fetch('/api/prebooks?filter=' + jobFilter);
     const bookings = await resp.json();
+    currentBookings = bookings;
     renderJobsTable(bookings);
   } catch(e) { console.error('Failed to load jobs:', e); }
 }
@@ -973,7 +1246,7 @@ async function loadJobs() {
 function renderJobsTable(bookings) {
   const tbody = document.getElementById('jobsTableBody');
   if (!bookings || bookings.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" style="padding:20px;text-align:center;color:#555;font-family:monospace;">No bookings to display</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="padding:20px;text-align:center;color:#555;font-family:monospace;">No bookings to display</td></tr>';
     return;
   }
   const statusColour = {pending:'#888', dispatched:'#ffb347', accepted:'#00d4ff', completed:'#444', cancelled:'#555'};
@@ -988,14 +1261,15 @@ function renderJobsTable(bookings) {
       ? '<span style="color:#a78bfa;font-size:10px;margin-right:3px;">PRE</span>'
       : '<span style="color:#ffb347;font-size:10px;margin-right:3px;">NOW</span>';
     const actions = done ? '' :
-      '<button onclick="completeJob(\''+b.id+'\')" style="padding:3px 8px;background:#22c55e22;border:1px solid #22c55e;color:#22c55e;border-radius:3px;cursor:pointer;font-family:monospace;font-size:10px;margin-right:4px;">✓</button>' +
-      '<button onclick="cancelJob(\''+b.id+'\')"   style="padding:3px 8px;background:#ef444422;border:1px solid #ef4444;color:#ef4444;border-radius:3px;cursor:pointer;font-family:monospace;font-size:10px;">✕</button>';
-    return '<tr style="'+dim+'border-bottom:1px solid #1a1a2e;">' +
+      '<button onclick="event.stopPropagation();completeJob(\''+b.id+'\')" style="padding:3px 8px;background:#22c55e22;border:1px solid #22c55e;color:#22c55e;border-radius:3px;cursor:pointer;font-family:monospace;font-size:10px;margin-right:4px;">✓</button>' +
+      '<button onclick="event.stopPropagation();cancelJob(\''+b.id+'\')"   style="padding:3px 8px;background:#ef444422;border:1px solid #ef4444;color:#ef4444;border-radius:3px;cursor:pointer;font-family:monospace;font-size:10px;">✕</button>';
+    return '<tr onclick="selectBookingRow(\''+b.id+'\',this)" style="cursor:pointer;'+dim+'border-bottom:1px solid #1a1a2e;border-left:3px solid transparent;">' +
       '<td style="padding:8px 10px;color:#e0e0e0;white-space:nowrap;">'+typeTag+timeStr+'</td>' +
       '<td style="padding:8px 10px;color:#e0e0e0;">'+( b.customer_name||'—')+(b.is_account?'<span style="color:#a78bfa;font-size:10px;margin-left:4px;">ACC</span>':'')+'</td>' +
       '<td style="padding:8px 10px;color:#ccc;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+(b.pickup_address||'—')+'</td>' +
       '<td style="padding:8px 10px;color:#888;font-size:11px;">'+(b.pickup_zone||'—')+'</td>' +
       '<td style="padding:8px 10px;color:#ccc;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+(b.dest_address||'—')+'</td>' +
+      '<td style="padding:8px 10px;color:#888;font-size:11px;">'+(b.dest_zone||'—')+'</td>' +
       '<td style="padding:8px 10px;color:#aaa;">'+(b.assigned_driver||'—')+'</td>' +
       '<td style="padding:8px 10px;"><span style="color:'+(statusColour[b.status]||'#888')+';font-size:11px;">'+(statusLabel[b.status]||b.status.toUpperCase())+'</span></td>' +
       '<td style="padding:8px 10px;white-space:nowrap;">'+actions+'</td>' +
@@ -1018,60 +1292,7 @@ async function cancelJob(id) {
 loadJobs();
 setInterval(loadJobs, 30000);
 </script>
-<div id="prebookModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:2000;align-items:center;justify-content:center;">
-  <div style="background:#1a1a2e;border:1px solid #444;border-radius:8px;width:680px;max-width:95vw;max-height:90vh;overflow-y:auto;padding:24px;color:#e0e0e0;font-family:monospace;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-      <h2 style="margin:0;color:#00d4ff;font-size:18px;">📋 New Booking</h2>
-      <button onclick="closePrebookModal()" style="background:none;border:none;color:#888;font-size:20px;cursor:pointer;">✕</button>
-    </div>
-    <div style="display:flex;gap:8px;margin-bottom:20px;">
-      <button id="modeImmediate" onclick="setBookingMode('immediate')" style="flex:1;padding:10px;border:2px solid #00d4ff;background:#00d4ff22;color:#00d4ff;border-radius:4px;cursor:pointer;font-family:monospace;font-size:13px;">⚡ IMMEDIATE</button>
-      <button id="modePrebook" onclick="setBookingMode('prebook')" style="flex:1;padding:10px;border:2px solid #444;background:transparent;color:#888;border-radius:4px;cursor:pointer;font-family:monospace;font-size:13px;">🕐 PRE-BOOK</button>
-    </div>
-    <div id="prebookTimeRow" style="display:none;margin-bottom:16px;">
-      <label style="display:block;font-size:11px;color:#888;margin-bottom:4px;">PICKUP DATE &amp; TIME</label>
-      <input id="bkRequestedTime" type="datetime-local" style="width:100%;padding:8px;background:#0d0d1a;border:1px solid #444;color:#e0e0e0;border-radius:4px;font-family:monospace;box-sizing:border-box;" />
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
-      <div>
-        <label style="display:block;font-size:11px;color:#888;margin-bottom:4px;">PASSENGER NAME</label>
-        <input id="bkCustomerName" type="text" placeholder="e.g. Jane Smith" style="width:100%;padding:8px;background:#0d0d1a;border:1px solid #444;color:#e0e0e0;border-radius:4px;font-family:monospace;box-sizing:border-box;" />
-      </div>
-      <div>
-        <label style="display:block;font-size:11px;color:#888;margin-bottom:4px;">PHONE</label>
-        <input id="bkPhone" type="tel" placeholder="e.g. 01702 123456" style="width:100%;padding:8px;background:#0d0d1a;border:1px solid #444;color:#e0e0e0;border-radius:4px;font-family:monospace;box-sizing:border-box;" />
-      </div>
-    </div>
-    <div style="margin-bottom:16px;">
-      <label style="display:block;font-size:11px;color:#888;margin-bottom:4px;">PICKUP ADDRESS</label>
-      <div style="display:flex;gap:8px;align-items:center;">
-        <input id="bkPickupAddress" type="text" placeholder="e.g. 42 London Road, Southend" style="flex:1;padding:8px;background:#0d0d1a;border:1px solid #444;color:#e0e0e0;border-radius:4px;font-family:monospace;" onblur="geocodeAddress('pickup')" />
-        <span id="bkPickupStatus" style="font-size:18px;width:24px;text-align:center;"></span>
-      </div>
-      <div id="bkPickupZoneTag" style="font-size:11px;color:#888;margin-top:4px;"></div>
-    </div>
-    <div style="margin-bottom:16px;">
-      <label style="display:block;font-size:11px;color:#888;margin-bottom:4px;">DESTINATION ADDRESS</label>
-      <div style="display:flex;gap:8px;align-items:center;">
-        <input id="bkDestAddress" type="text" placeholder="e.g. Southend Airport" style="flex:1;padding:8px;background:#0d0d1a;border:1px solid #444;color:#e0e0e0;border-radius:4px;font-family:monospace;" onblur="geocodeAddress('dest')" />
-        <span id="bkDestStatus" style="font-size:18px;width:24px;text-align:center;"></span>
-      </div>
-      <div id="bkDestZoneTag" style="font-size:11px;color:#888;margin-top:4px;"></div>
-    </div>
-    <div style="margin-bottom:16px;">
-      <label style="display:block;font-size:11px;color:#888;margin-bottom:4px;">NOTES / SPECIAL INSTRUCTIONS</label>
-      <textarea id="bkNotes" rows="2" placeholder="e.g. wheelchair access, large luggage" style="width:100%;padding:8px;background:#0d0d1a;border:1px solid #444;color:#e0e0e0;border-radius:4px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px;">
-      <input id="bkIsAccount" type="checkbox" style="width:16px;height:16px;" />
-      <label for="bkIsAccount" style="font-size:13px;color:#aaa;cursor:pointer;">Account customer</label>
-    </div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;">
-      <button onclick="closePrebookModal()" style="padding:10px 20px;background:transparent;border:1px solid #555;color:#888;border-radius:4px;cursor:pointer;font-family:monospace;">Cancel</button>
-      <button onclick="submitBooking()" style="padding:10px 24px;background:#00d4ff;border:none;color:#000;border-radius:4px;cursor:pointer;font-family:monospace;font-weight:bold;font-size:14px;">✓ CONFIRM BOOKING</button>
-    </div>
-  </div>
-</div>
+<div id="prebookModal" style="display:none;"></div>
 </body>
 </html>
 `
