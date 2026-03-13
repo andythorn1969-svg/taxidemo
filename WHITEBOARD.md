@@ -16,7 +16,7 @@ This is a demo / proof-of-concept. There is no database — all state lives in m
 
 ## Current Status
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Server:** `http://localhost:8080`
 **Branch:** `master`
 **Remote:** `https://github.com/andythorn1969-svg/taxidemo`
@@ -33,6 +33,11 @@ This is a demo / proof-of-concept. There is no database — all state lives in m
 | 9 | Destination markers (purple) and dashed journey lines per booking |
 | 10 | Landscape layout redesign — two-column dispatch console, plate number badges on driver markers |
 | 11 | Pre-book system — modal, Nominatim geocoding, jobs list panel, prebook scheduler, zone matching |
+| 12 | Three-column layout redesign — booking form left, map centre, trap queues right |
+| 13 | Left panel as single always-visible action panel; click-to-edit from jobs list |
+| 14 | Driver movement simulation — StatusDispatched/StatusOnJob, fixed linear step, 5s tick |
+| 15 | Zone names resolved in jobs table; driver name on dispatched jobs; destination zone column |
+| 16 | Map legend — available/dispatched/pickup/destination/zone boundaries |
 
 ---
 
@@ -136,27 +141,14 @@ The entire HTML page is a single Go `text/template` const (`indexHTML`) embedded
 
 ---
 
-## Next Steps
+## Session 4 To-Do
 
-- [ ] Improve `FindNearestDriver` to use actual Haversine geo-distance
-- [ ] Add driver "return to zone" logic after completing a job
-- [ ] Persist state to a file or SQLite so it survives restarts
-- [ ] Add websocket or SSE so the UI updates without a page refresh
-- [ ] Add a legend to the map (green=available, red=busy, blue=pickup, purple=destination)
-
----
-
-## Session 3 To-Do
-
-Priority order for next session:
-
-1. **Three-column layout redesign** — equal thirds: booking form left, live map centre, trap queues right. Jobs list full width below all three columns.
-2. **Left panel as single action panel** — all booking creation and editing happens in the left column. No separate modal. The panel is always visible.
-3. **Edit mode via jobs list** — clicking a row in the jobs list populates the left panel in edit mode (pre-filled fields, submit updates rather than creates).
-4. **Zone names showing as IDs** — zone column in jobs list displays raw IDs (e.g. `Z18`) instead of readable names (e.g. `Town`). Needs the same `zoneName` lookup used in the template.
-5. **Driver name missing on dispatched jobs** — jobs table shows no driver name after dispatch. Driver reference on `Job.Driver` needs surfacing in the JSON/render path.
-6. **Destination zone column empty** — destination zone not being set or returned for jobs. Investigate whether `DestZone` field is missing from `Booking` or just not populated.
-7. **General cosmetic tweaks** — tighten spacing, consistent font sizes, readable colour contrast throughout.
+1. **Haversine distance for `FindNearestDriver`** — replace the current linear scan with actual geo-distance so fallback dispatch picks the geographically closest available driver.
+2. **Driver return-to-zone logic review** — after a job completes the driver is marked available but stays at the destination. Decide whether to route them back to their home zone or leave them in place for reassignment.
+3. **State persistence** — persist bookings, jobs, and driver positions to a file or SQLite so state survives server restarts.
+4. **Websocket / SSE live updates** — push map and jobs table updates to the browser instead of polling every 5–30 seconds.
+5. **Authentication** — the dispatch console is fully open. Add at minimum a simple shared-secret login so only authorised operators can create or modify bookings.
+6. **Cosmetic polish pass** — tighten spacing, consistent font sizes, readable colour contrast, mobile-friendly layout review.
 
 ### Future milestone
 - **OSRM live routing** — replace the fixed `AverageApproachMinutes` zone lookup with a real road-distance call to an OSRM instance. Approach time would be calculated from driver GPS position to pickup GPS position at dispatch time.
